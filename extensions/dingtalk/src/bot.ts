@@ -391,6 +391,7 @@ export async function handleDingtalkMessage(params: {
     }
 
     const textApi = core.channel?.text;
+    
     const textChunkLimit =
       textApi?.resolveTextChunkLimit?.({
         cfg,
@@ -398,7 +399,8 @@ export async function handleDingtalkMessage(params: {
         defaultLimit: dingtalkCfg.textChunkLimit ?? 4000,
       }) ?? (dingtalkCfg.textChunkLimit ?? 4000);
     const chunkMode = textApi?.resolveChunkMode?.(cfg, "dingtalk");
-    const tableMode = textApi?.resolveMarkdownTableMode?.({ cfg, channel: "dingtalk" });
+    // 钉钉不支持 Markdown 表格和代码块，强制使用 bullets 模式转换为列表
+    const tableMode = "bullets";
 
     const deliver = async (payload: { text?: string; mediaUrl?: string; mediaUrls?: string[] }) => {
       const targetId = isGroup ? ctx.conversationId : ctx.senderId;
@@ -419,9 +421,12 @@ export async function handleDingtalkMessage(params: {
 
       const rawText = payload.text ?? "";
       if (!rawText.trim()) return;
+      
+      // 转换表格：使用 Moltbot 核心的转换，不可用时直接用原始文本
       const converted = textApi?.convertMarkdownTables
         ? textApi.convertMarkdownTables(rawText, tableMode)
         : rawText;
+      
       const chunks =
         textApi?.chunkTextWithMode && typeof textChunkLimit === "number" && textChunkLimit > 0
           ? textApi.chunkTextWithMode(converted, textChunkLimit, chunkMode)

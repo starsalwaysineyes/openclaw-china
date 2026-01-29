@@ -2,7 +2,7 @@
  * 钉钉发送消息 API
  *
  * 提供:
- * - sendMessageDingtalk: 发送文本/Markdown 消息（单聊/群聊）
+ * - sendMessageDingtalk: 发送 Markdown 消息（单聊/群聊）
  *
  * API 文档:
  * - 单聊: https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches
@@ -20,14 +20,6 @@ const REQUEST_TIMEOUT = 30000;
 
 /** Markdown 默认标题 */
 const DEFAULT_MARKDOWN_TITLE = "Moltbot";
-
-/**
- * 检测文本是否包含 Markdown 语法
- */
-function detectMarkdown(text: string): boolean {
-  // 检测常见 markdown 语法: 标题、列表、粗体、斜体、代码、链接等
-  return /^[#*>-]|[*_`#[\]]/.test(text) || text.includes("\n");
-}
 
 /**
  * 从文本中提取标题（取第一行，去除 markdown 符号）
@@ -50,8 +42,6 @@ export interface SendMessageParams {
   text: string;
   /** 聊天类型 */
   chatType: "direct" | "group";
-  /** 强制使用 Markdown 格式（可选，默认自动检测） */
-  useMarkdown?: boolean;
   /** Markdown 消息标题（可选） */
   title?: string;
 }
@@ -66,13 +56,13 @@ interface DingtalkApiError {
 }
 
 /**
- * 发送文本/Markdown 消息到钉钉
+ * 发送 Markdown 消息到钉钉
  *
  * 根据 chatType 调用不同的 API:
  * - direct: /v1.0/robot/oToMessages/batchSend (单聊批量发送)
  * - group: /v1.0/robot/groupMessages/send (群聊发送)
  *
- * 自动检测 Markdown 语法，使用 sampleMarkdown 模板渲染
+ * 始终使用 sampleMarkdown 模板，支持表格、代码块等格式
  *
  * @param params 发送参数
  * @returns 发送结果
@@ -81,7 +71,7 @@ interface DingtalkApiError {
 export async function sendMessageDingtalk(
   params: SendMessageParams
 ): Promise<DingtalkSendResult> {
-  const { cfg, to, text, chatType, useMarkdown, title } = params;
+  const { cfg, to, text, chatType, title } = params;
 
   // 验证凭证
   if (!cfg.clientId || !cfg.clientSecret) {
@@ -91,14 +81,13 @@ export async function sendMessageDingtalk(
   // 获取 Access Token
   const accessToken = await getAccessToken(cfg.clientId, cfg.clientSecret);
 
-  // 决定是否使用 Markdown 格式
-  const shouldUseMarkdown = useMarkdown !== undefined ? useMarkdown : detectMarkdown(text);
+  // 提取标题
   const msgTitle = title || extractTitle(text, DEFAULT_MARKDOWN_TITLE);
 
   if (chatType === "direct") {
-    return sendDirectMessage({ cfg, to, text, accessToken, useMarkdown: shouldUseMarkdown, title: msgTitle });
+    return sendDirectMessage({ cfg, to, text, accessToken, title: msgTitle });
   } else {
-    return sendGroupMessage({ cfg, to, text, accessToken, useMarkdown: shouldUseMarkdown, title: msgTitle });
+    return sendGroupMessage({ cfg, to, text, accessToken, title: msgTitle });
   }
 }
 
@@ -107,7 +96,7 @@ export async function sendMessageDingtalk(
  * 发送单聊消息
  *
  * 调用 /v1.0/robot/oToMessages/batchSend API
- * 支持 sampleText（纯文本）和 sampleMarkdown（Markdown）两种模板
+ * 始终使用 sampleMarkdown 模板
  *
  * @internal
  */
@@ -116,19 +105,12 @@ async function sendDirectMessage(params: {
   to: string;
   text: string;
   accessToken: string;
-  useMarkdown: boolean;
   title: string;
 }): Promise<DingtalkSendResult> {
-  const { cfg, to, text, accessToken, useMarkdown, title } = params;
+  const { cfg, to, text, accessToken, title } = params;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-  // 根据是否使用 Markdown 选择不同的消息模板
-  const msgKey = useMarkdown ? "sampleMarkdown" : "sampleText";
-  const msgParam = useMarkdown
-    ? JSON.stringify({ title, text })
-    : JSON.stringify({ content: text });
 
   try {
     const response = await fetch(
@@ -142,8 +124,8 @@ async function sendDirectMessage(params: {
         body: JSON.stringify({
           robotCode: cfg.clientId,
           userIds: [to],
-          msgKey,
-          msgParam,
+          msgKey: "sampleMarkdown",
+          msgParam: JSON.stringify({ title, text }),
         }),
         signal: controller.signal,
       }
@@ -196,7 +178,7 @@ async function sendDirectMessage(params: {
  * 发送群聊消息
  *
  * 调用 /v1.0/robot/groupMessages/send API
- * 支持 sampleText（纯文本）和 sampleMarkdown（Markdown）两种模板
+ * 始终使用 sampleMarkdown 模板
  *
  * @internal
  */
@@ -205,19 +187,12 @@ async function sendGroupMessage(params: {
   to: string;
   text: string;
   accessToken: string;
-  useMarkdown: boolean;
   title: string;
 }): Promise<DingtalkSendResult> {
-  const { cfg, to, text, accessToken, useMarkdown, title } = params;
+  const { cfg, to, text, accessToken, title } = params;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-  // 根据是否使用 Markdown 选择不同的消息模板
-  const msgKey = useMarkdown ? "sampleMarkdown" : "sampleText";
-  const msgParam = useMarkdown
-    ? JSON.stringify({ title, text })
-    : JSON.stringify({ content: text });
 
   try {
     const response = await fetch(
@@ -231,8 +206,8 @@ async function sendGroupMessage(params: {
         body: JSON.stringify({
           robotCode: cfg.clientId,
           openConversationId: to,
-          msgKey,
-          msgParam,
+          msgKey: "sampleMarkdown",
+          msgParam: JSON.stringify({ title, text }),
         }),
         signal: controller.signal,
       }
