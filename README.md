@@ -27,6 +27,7 @@ clawdbot plugins install @moltbot-china/dingtalk
 moltbot plugins install @moltbot-china/dingtalk
 ```
 
+
 ## 钉钉配置
 
 > 📖 **[钉钉企业注册指南](doc/guides/dingtalk/configuration.md)** — 无需任何材料，最快 5 分钟完成配置
@@ -89,11 +90,21 @@ moltbot gateway restart
 
 ## 开发
 
+适合需要二次开发或调试的场景：
+
 ```bash
+# 克隆仓库
 git clone https://github.com/BytePioneer-AI/moltbot-china.git
 cd moltbot-china
+
+# 安装依赖并构建
 pnpm install
 pnpm build
+
+# 以链接模式安装（修改代码后实时生效）
+clawdbot plugins install -l ./extensions/dingtalk
+# 或
+moltbot plugins install -l ./extensions/dingtalk
 ```
 
 ## License
