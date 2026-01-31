@@ -7,7 +7,8 @@
   "files": [
     "dist",
     "moltbot.plugin.json",
-    "clawdbot.plugin.json"
+    "clawdbot.plugin.json",
+    "openclaw.plugin.json"
   ],
   "openclaw": {
     "extensions": [
