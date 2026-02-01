@@ -4,15 +4,80 @@
  * 提供:
  * - uploadMediaDingtalk: 上传媒体到钉钉存储
  * - sendMediaDingtalk: 发送媒体消息
+ * - FileSizeLimitError: 文件大小超限错误
+ * - TimeoutError: 下载超时错误
  *
  * API 文档:
  * - 上传媒体: https://open.dingtalk.com/document/orgapp/upload-media-files
  * - 发送图片: https://open.dingtalk.com/document/orgapp/chatbots-send-one-on-one-chat-messages-in-batches
+ * - 下载文件: https://open.dingtalk.com/document/orgapp/download-the-file-content-of-the-robot-receiving-message
  */
 
 import { getAccessToken } from "./client.js";
-import type { DingtalkConfig, DingtalkSendResult } from "./types.js";
+import { resolveExtension } from "@openclaw-china/shared";
+import type { Logger } from "./logger.js";
+import * as os from "os";
 import * as path from "path";
+import * as fsPromises from "fs/promises";
+
+/**
+ * Error thrown when file size exceeds the limit for the message type
+ *
+ * @example
+ * ```typescript
+ * throw new FileSizeLimitError(15_000_000, 10_000_000, 'picture');
+ * // Error: File size 15000000 bytes exceeds limit 10000000 bytes for picture
+ * ```
+ */
+export class FileSizeLimitError extends Error {
+  /** Actual file size in bytes */
+  public readonly actualSize: number;
+  /** Size limit in bytes for the message type */
+  public readonly limitSize: number;
+  /** Message type (picture, video, audio, file) */
+  public readonly msgType: string;
+
+  constructor(actualSize: number, limitSize: number, msgType: string) {
+    super(
+      `File size ${actualSize} bytes exceeds limit ${limitSize} bytes for ${msgType}`
+    );
+    this.name = "FileSizeLimitError";
+    this.actualSize = actualSize;
+    this.limitSize = limitSize;
+    this.msgType = msgType;
+
+    // Maintains proper stack trace for where error was thrown (V8 engines)
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, FileSizeLimitError);
+    }
+  }
+}
+
+/**
+ * Error thrown when download times out
+ *
+ * @example
+ * ```typescript
+ * throw new TimeoutError(120000);
+ * // Error: Download timed out after 120000ms
+ * ```
+ */
+export class TimeoutError extends Error {
+  /** Timeout duration in milliseconds */
+  public readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Download timed out after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+    this.timeoutMs = timeoutMs;
+
+    // Maintains proper stack trace for where error was thrown (V8 engines)
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, TimeoutError);
+    }
+  }
+}
+import type { DingtalkConfig, DingtalkSendResult } from "./types.js";
 import * as fs from "fs";
 
 /** 钉钉 API 基础 URL */
@@ -557,5 +622,711 @@ async function sendGroupMediaMessage(params: {
     throw err;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+// ============================================================================
+// Media Receiving Functions
+// ============================================================================
+
+/**
+ * Supported media message types for extraction
+ */
+export type MediaMsgType = "picture" | "video" | "audio" | "file";
+
+/**
+ * Extracted file information from a DingTalk message
+ */
+export interface ExtractedFileInfo {
+  /** Download code for retrieving the file */
+  downloadCode: string;
+  /** Message type */
+  msgType: MediaMsgType;
+  /** Original file name (file type only) */
+  fileName?: string;
+  /** File size in bytes (file type only) */
+  fileSize?: number;
+  /** Duration in milliseconds (audio/video) */
+  duration?: number;
+  /** Speech recognition text (audio only) */
+  recognition?: string;
+}
+
+/**
+ * Content structure for media messages
+ * @internal
+ */
+interface MediaContent {
+  downloadCode?: string;
+  pictureDownloadCode?: string;
+  videoDownloadCode?: string;
+  duration?: number;
+  recognition?: string;
+  fileName?: string;
+  fileSize?: number;
+}
+
+/**
+ * Parse content field which may be a JSON string or object
+ * @internal
+ */
+function parseContent(content: unknown): MediaContent | null {
+  if (!content) return null;
+
+  if (typeof content === "string") {
+    try {
+      const parsed = JSON.parse(content);
+      // Ensure parsed result is an object, not an array
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as MediaContent;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Ensure content is an object, not an array
+  if (typeof content === "object" && !Array.isArray(content)) {
+    return content as MediaContent;
+  }
+
+  return null;
+}
+
+/**
+ * Extract download code with fallback for picture/video types
+ * @internal
+ */
+function extractDownloadCode(
+  content: MediaContent,
+  msgType: MediaMsgType
+): string | null {
+  // Primary: downloadCode
+  if (content.downloadCode) {
+    return content.downloadCode;
+  }
+
+  // Fallback for picture type
+  if (msgType === "picture" && content.pictureDownloadCode) {
+    return content.pictureDownloadCode;
+  }
+
+  // Fallback for video type
+  if (msgType === "video" && content.videoDownloadCode) {
+    return content.videoDownloadCode;
+  }
+
+  return null;
+}
+
+/**
+ * Extract file information from a DingTalk message
+ *
+ * Handles picture, video, audio, and file message types.
+ * Supports both object and JSON string content formats.
+ *
+ * @param data Raw message data from DingTalk Stream SDK
+ * @returns Extracted file info or null if not a media message
+ *
+ * @example
+ * ```typescript
+ * const fileInfo = extractFileFromMessage(rawMessage);
+ * if (fileInfo) {
+ *   console.log(`Download code: ${fileInfo.downloadCode}`);
+ *   console.log(`Type: ${fileInfo.msgType}`);
+ * }
+ * ```
+ *
+ * Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6
+ */
+export function extractFileFromMessage(data: unknown): ExtractedFileInfo | null {
+  // Validate input is an object
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const msg = data as Record<string, unknown>;
+
+  // Get message type
+  const msgtype = msg.msgtype;
+  if (typeof msgtype !== "string") {
+    return null;
+  }
+
+  // Check if it's a supported media type
+  const supportedTypes: MediaMsgType[] = ["picture", "video", "audio", "file"];
+  if (!supportedTypes.includes(msgtype as MediaMsgType)) {
+    return null;
+  }
+
+  const msgType = msgtype as MediaMsgType;
+
+  // Parse content (may be string or object)
+  const content = parseContent(msg.content);
+  if (!content) {
+    return null;
+  }
+
+  // Extract download code with fallback
+  const downloadCode = extractDownloadCode(content, msgType);
+  if (!downloadCode) {
+    return null;
+  }
+
+  // Build result based on message type
+  const result: ExtractedFileInfo = {
+    downloadCode,
+    msgType,
+  };
+
+  // Add type-specific fields
+  switch (msgType) {
+    case "picture":
+      // Picture has no additional fields
+      break;
+
+    case "video":
+      // Video has duration
+      if (typeof content.duration === "number") {
+        result.duration = content.duration;
+      }
+      break;
+
+    case "audio":
+      // Audio has duration and recognition
+      if (typeof content.duration === "number") {
+        result.duration = content.duration;
+      }
+      if (typeof content.recognition === "string") {
+        result.recognition = content.recognition;
+      }
+      break;
+
+    case "file":
+      // File has fileName and fileSize
+      if (typeof content.fileName === "string") {
+        result.fileName = content.fileName;
+      }
+      if (typeof content.fileSize === "number") {
+        result.fileSize = content.fileSize;
+      }
+      break;
+  }
+
+  return result;
+}
+
+/**
+ * Rich text element structure from DingTalk
+ */
+export interface RichTextElement {
+  /** Element type: text, picture, or at */
+  type: "text" | "picture" | "at";
+  /** Text content (for text type) */
+  text?: string;
+  /** Download code (for picture type) */
+  downloadCode?: string;
+  /** Fallback download code (for picture type) */
+  pictureDownloadCode?: string;
+  /** User ID (for at/mention type) */
+  userId?: string;
+}
+
+/**
+ * Parsed rich text message result
+ */
+export interface RichTextParseResult {
+  /** Array of text parts (to be joined with newlines) */
+  textParts: string[];
+  /** Download codes for images */
+  imageCodes: string[];
+  /** Mentioned user IDs */
+  mentions: string[];
+}
+
+/**
+ * Parse richText field which may be a JSON string or array
+ * @internal
+ */
+function parseRichText(richText: unknown): RichTextElement[] | null {
+  if (!richText) return null;
+
+  if (typeof richText === "string") {
+    try {
+      const parsed = JSON.parse(richText);
+      if (Array.isArray(parsed)) {
+        return parsed as RichTextElement[];
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  if (Array.isArray(richText)) {
+    return richText as RichTextElement[];
+  }
+
+  return null;
+}
+
+/**
+ * Parse content field for richText messages (may be JSON string or object)
+ * @internal
+ */
+function parseRichTextContent(content: unknown): Record<string, unknown> | null {
+  if (!content) return null;
+
+  if (typeof content === "string") {
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof content === "object" && !Array.isArray(content)) {
+    return content as Record<string, unknown>;
+  }
+
+  return null;
+}
+
+/**
+ * Parse a richText message from DingTalk
+ *
+ * Extracts text elements, picture download codes, and mentions from
+ * a richText message. Supports both array and JSON string formats for
+ * both the content field and the richText field within it.
+ *
+ * @param data Raw message data from DingTalk Stream SDK
+ * @returns Parsed result or null if invalid/not a richText message
+ *
+ * @example
+ * ```typescript
+ * const result = parseRichTextMessage(rawMessage);
+ * if (result) {
+ *   const fullText = result.textParts.join('\n');
+ *   console.log(`Text: ${fullText}`);
+ *   console.log(`Images: ${result.imageCodes.length}`);
+ *   console.log(`Mentions: ${result.mentions.join(', ')}`);
+ * }
+ * ```
+ *
+ * Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6
+ */
+export function parseRichTextMessage(data: unknown): RichTextParseResult | null {
+  // Validate input is an object
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const msg = data as Record<string, unknown>;
+
+  // Check if it's a richText message type
+  if (msg.msgtype !== "richText") {
+    return null;
+  }
+
+  // Parse content field (may be JSON string or object) - Requirement 3.4
+  const contentObj = parseRichTextContent(msg.content);
+  if (!contentObj) {
+    return null;
+  }
+
+  // Parse richText array (may be string or array)
+  const richTextElements = parseRichText(contentObj.richText);
+  if (!richTextElements || richTextElements.length === 0) {
+    return null;
+  }
+
+  const textParts: string[] = [];
+  const imageCodes: string[] = [];
+  const mentions: string[] = [];
+
+  // Process each element
+  for (const element of richTextElements) {
+    if (!element || typeof element !== "object") {
+      continue;
+    }
+
+    const elementType = element.type;
+    const hasText = typeof element.text === "string";
+
+    // Some DingTalk richText elements omit "type" for text nodes.
+    if (!elementType && hasText) {
+      textParts.push(element.text as string);
+      continue;
+    }
+
+    switch (elementType) {
+      case "text":
+        // Extract text content
+        if (hasText) {
+          textParts.push(element.text as string);
+        }
+        break;
+
+      case "picture": {
+        // Extract download code with fallback
+        const code = element.downloadCode || element.pictureDownloadCode;
+        if (typeof code === "string" && code) {
+          imageCodes.push(code);
+        }
+        break;
+      }
+
+      case "at":
+        // Extract user ID (singular, as per DingTalk API)
+        if (typeof element.userId === "string" && element.userId) {
+          mentions.push(element.userId);
+        }
+        break;
+    }
+  }
+
+  return {
+    textParts,
+    imageCodes,
+    mentions,
+  };
+}
+
+// ============================================================================
+// File Download Functions
+// ============================================================================
+
+/**
+ * File size limits by message type (in bytes)
+ */
+const FILE_SIZE_LIMITS: Record<string, number> = {
+  picture: 10 * 1024 * 1024, // 10MB
+  video: 20 * 1024 * 1024, // 20MB
+  audio: 2 * 1024 * 1024, // 2MB
+  file: 20 * 1024 * 1024, // 20MB
+};
+
+/** Download timeout in milliseconds (120 seconds) */
+const DOWNLOAD_TIMEOUT = 120_000;
+
+/**
+ * Downloaded file information
+ */
+export interface DownloadedFile {
+  /** Absolute path to the downloaded file */
+  path: string;
+  /** MIME content type */
+  contentType: string;
+  /** File size in bytes */
+  size: number;
+  /** Original file name (if available) */
+  fileName?: string;
+}
+
+/**
+ * Parameters for downloading a file from DingTalk
+ */
+export interface DownloadDingTalkFileParams {
+  /** Download code from the message */
+  downloadCode: string;
+  /** Robot code (clientId) */
+  robotCode: string;
+  /** Access token for API authentication */
+  accessToken: string;
+  /** Original file name (optional, used for extension resolution) */
+  fileName?: string;
+  /** Message type for size limit enforcement */
+  msgType?: MediaMsgType;
+  /** Logger instance (optional) */
+  log?: Logger;
+}
+
+/**
+ * Download a file from DingTalk using downloadCode
+ *
+ * Download flow:
+ * 1. POST to DingTalk API with downloadCode to get downloadUrl
+ * 2. GET request to downloadUrl
+ * 3. Check Content-Length header against size limit for msgType
+ *    - If Content-Length present and exceeds limit: abort immediately, throw FileSizeLimitError
+ *    - If Content-Length absent: proceed to streaming download
+ * 4. Stream response body while counting bytes
+ *    - If accumulated bytes exceed limit: abort stream, throw FileSizeLimitError
+ * 5. Save to os.tmpdir() with appropriate extension
+ *
+ * @param params Download parameters
+ * @returns Downloaded file information
+ * @throws Error if API returns error or downloadUrl is missing
+ * @throws TimeoutError if download exceeds 120 seconds
+ * @throws FileSizeLimitError if file exceeds size limit for msgType
+ *
+ * @example
+ * ```typescript
+ * const file = await downloadDingTalkFile({
+ *   downloadCode: 'abc123',
+ *   robotCode: 'dingxxx',
+ *   accessToken: 'token',
+ *   msgType: 'picture',
+ * });
+ * console.log(`Downloaded to: ${file.path}`);
+ * ```
+ *
+ * Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6
+ */
+export async function downloadDingTalkFile(
+  params: DownloadDingTalkFileParams
+): Promise<DownloadedFile> {
+  const { downloadCode, robotCode, accessToken, fileName, log } = params;
+  // Default msgType to "file" to ensure size limits are always enforced
+  const msgType = params.msgType ?? "file";
+
+  // Step 1: Get download URL from DingTalk API (with separate timeout)
+  const apiController = new AbortController();
+  const apiTimeoutId = setTimeout(() => apiController.abort(), REQUEST_TIMEOUT);
+
+  let downloadUrl: string;
+
+  try {
+    log?.debug?.(`Getting download URL for code: ${downloadCode.slice(0, 10)}...`);
+
+    const apiResponse = await fetch(
+      `${DINGTALK_API_BASE}/v1.0/robot/messageFiles/download`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-acs-dingtalk-access-token": accessToken,
+        },
+        body: JSON.stringify({
+          downloadCode,
+          robotCode,
+        }),
+        signal: apiController.signal,
+      }
+    );
+
+    if (!apiResponse.ok) {
+      const errorText = await apiResponse.text();
+      throw new Error(
+        `DingTalk API error: HTTP ${apiResponse.status} - ${errorText}`
+      );
+    }
+
+    const apiData = (await apiResponse.json()) as { downloadUrl?: string };
+
+    if (!apiData.downloadUrl) {
+      throw new Error("DingTalk API returned no downloadUrl");
+    }
+
+    downloadUrl = apiData.downloadUrl;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`DingTalk API request timed out after ${REQUEST_TIMEOUT}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(apiTimeoutId);
+  }
+
+  log?.debug?.(`Got download URL, starting download...`);
+
+  // Step 2: Download the file (with dedicated 120s timeout)
+  const downloadController = new AbortController();
+  const downloadTimeoutId = setTimeout(() => downloadController.abort(), DOWNLOAD_TIMEOUT);
+
+  try {
+    const fileResponse = await fetch(downloadUrl, {
+      signal: downloadController.signal,
+    });
+
+    if (!fileResponse.ok) {
+      throw new Error(
+        `File download failed: HTTP ${fileResponse.status}`
+      );
+    }
+
+    // Get content type and content length
+    const contentType = fileResponse.headers.get("content-type") || "application/octet-stream";
+    const contentLengthHeader = fileResponse.headers.get("content-length");
+    const contentLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : null;
+
+    // Step 3: Check Content-Length against size limit
+    const sizeLimit = FILE_SIZE_LIMITS[msgType];
+
+    if (contentLength !== null && contentLength > sizeLimit) {
+      // Abort immediately without downloading body
+      downloadController.abort();
+      throw new FileSizeLimitError(contentLength, sizeLimit, msgType);
+    }
+
+    // Step 4: Stream response body while counting bytes
+    const body = fileResponse.body;
+    if (!body) {
+      throw new Error("Response body is null");
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    const reader = body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        totalBytes += value.length;
+
+        // Check size limit during streaming (when Content-Length was absent)
+        if (totalBytes > sizeLimit) {
+          reader.cancel();
+          throw new FileSizeLimitError(totalBytes, sizeLimit, msgType);
+        }
+
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    // Combine chunks into buffer
+    const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+
+    // Step 5: Save to tmpdir with correct extension
+    const extension = resolveExtension(contentType, fileName);
+    const tempFileName = `dingtalk-file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extension}`;
+    const tempFilePath = path.join(os.tmpdir(), tempFileName);
+
+    await fsPromises.writeFile(tempFilePath, buffer);
+
+    log?.debug?.(`File saved to: ${tempFilePath} (${totalBytes} bytes)`);
+
+    return {
+      path: tempFilePath,
+      contentType,
+      size: totalBytes,
+      fileName,
+    };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new TimeoutError(DOWNLOAD_TIMEOUT);
+    }
+    throw err;
+  } finally {
+    clearTimeout(downloadTimeoutId);
+  }
+}
+
+
+/**
+ * Parameters for downloading rich text images
+ */
+export interface DownloadRichTextImagesParams {
+  /** Download codes for images */
+  imageCodes: string[];
+  /** Robot code (clientId) */
+  robotCode: string;
+  /** Access token for API authentication */
+  accessToken: string;
+  /** Logger instance (optional) */
+  log?: Logger;
+}
+
+/**
+ * Download all images from a richText message
+ *
+ * Downloads images sequentially to avoid overwhelming DingTalk API rate limits.
+ * Continues on individual failures and collects successful downloads.
+ *
+ * @param params Download parameters
+ * @returns Array of successfully downloaded files (may be partial if some fail)
+ *
+ * @example
+ * ```typescript
+ * const files = await downloadRichTextImages({
+ *   imageCodes: ['code1', 'code2', 'code3'],
+ *   robotCode: 'dingxxx',
+ *   accessToken: 'token',
+ * });
+ * console.log(`Downloaded ${files.length} images`);
+ * ```
+ *
+ * Requirements: 4.1, 4.2, 4.3, 4.4
+ */
+export async function downloadRichTextImages(
+  params: DownloadRichTextImagesParams
+): Promise<DownloadedFile[]> {
+  const { imageCodes, robotCode, accessToken, log } = params;
+
+  const results: DownloadedFile[] = [];
+  const total = imageCodes.length;
+
+  for (let i = 0; i < total; i++) {
+    const code = imageCodes[i];
+    const index = i + 1; // 1-based for logging
+
+    // Log progress (Requirement 4.4)
+    log?.info?.(`downloading image ${index}/${total}`);
+
+    try {
+      // Download sequentially (Requirement 4.1)
+      const file = await downloadDingTalkFile({
+        downloadCode: code,
+        robotCode,
+        accessToken,
+        msgType: "picture",
+        log,
+      });
+
+      results.push(file);
+    } catch (err) {
+      // Log warning and continue (Requirement 4.2)
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log?.warn?.(`Failed to download image ${index}/${total}: ${errorMessage}`);
+      // Continue with remaining images
+    }
+  }
+
+  // Return successful downloads (Requirement 4.3)
+  return results;
+}
+
+
+/**
+ * Clean up a temporary file
+ *
+ * Deletes the file at the specified path. Silently ignores ENOENT errors
+ * (file not found) and logs debug messages for other errors.
+ *
+ * @param filePath Path to delete (optional, no-op if undefined)
+ * @param log Logger instance (optional)
+ *
+ * @example
+ * ```typescript
+ * await cleanupFile('/tmp/dingtalk-file-123.jpg');
+ * ```
+ *
+ * Requirements: 8.1, 8.3, 8.4
+ */
+export async function cleanupFile(filePath?: string, log?: Logger): Promise<void> {
+  if (!filePath) {
+    return;
+  }
+
+  try {
+    await fsPromises.unlink(filePath);
+  } catch (err) {
+    // Silently ignore ENOENT (file not found) errors (Requirement 8.3)
+    if (err instanceof Error && (err as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+
+    // Log debug for other errors (Requirement 8.4)
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    log?.debug?.(`Failed to cleanup file ${filePath}: ${errorMessage}`);
   }
 }

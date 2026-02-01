@@ -92,7 +92,7 @@
     "release:major": "npm run build && npm version major && npm publish"
   },
   "dependencies": {
-    "@openclaw-china/shared": "0.1.15",
+    "@openclaw-china/shared": "workspace:*",
     "dingtalk-stream": "^2.1.4"
   },
   "devDependencies": {

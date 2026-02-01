@@ -172,14 +172,21 @@ export async function monitorDingtalkProvider(opts: MonitorDingtalkOpts = {}): P
           }
 
           // 关键业务日志：收到消息
-          const content =
-            (rawMessage.msgtype === "text" ? rawMessage.text?.content : undefined) ??
-            rawMessage.content?.recognition ??
-            "";
-          const contentTrimmed = content.trim();
+          // content 可能是字符串或对象，需要处理
+          let contentText = "";
+          if (rawMessage.msgtype === "text" && rawMessage.text?.content) {
+            contentText = rawMessage.text.content;
+          } else if (rawMessage.content) {
+            const contentObj = typeof rawMessage.content === "string"
+              ? (() => { try { return JSON.parse(rawMessage.content); } catch { return null; } })()
+              : rawMessage.content;
+            if (contentObj && typeof contentObj === "object" && "recognition" in contentObj && typeof contentObj.recognition === "string") {
+              contentText = contentObj.recognition;
+            }
+          }
+          const contentTrimmed = contentText.trim();
           const senderName = rawMessage.senderNick ?? rawMessage.senderId;
           const textPreview = contentTrimmed.slice(0, 50);
-          
           logger.info(`Inbound: from=${senderName} text="${textPreview}${contentTrimmed.length > 50 ? "..." : ""}"`);
           logger.debug(`streamId=${streamMessageId ?? "none"} convo=${rawMessage.conversationId}`);
 

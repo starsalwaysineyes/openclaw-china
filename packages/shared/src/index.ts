@@ -5,3 +5,4 @@ export * from "./logger/index.js";
 export * from "./policy/index.js";
 export * from "./http/index.js";
 export * from "./types/common.js";
+export * from "./file/index.js";

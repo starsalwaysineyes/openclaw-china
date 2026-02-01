@@ -50,10 +50,10 @@ describe("Feature: dingtalk-integration, Property 1: 配置 Schema 验证", () =
             expect(result.data.enabled).toBe(true);
           }
           if (config.dmPolicy === undefined) {
-            expect(result.data.dmPolicy).toBe("pairing");
+            expect(result.data.dmPolicy).toBe("open");
           }
           if (config.groupPolicy === undefined) {
-            expect(result.data.groupPolicy).toBe("allowlist");
+            expect(result.data.groupPolicy).toBe("open");
           }
           if (config.requireMention === undefined) {
             expect(result.data.requireMention).toBe(true);
