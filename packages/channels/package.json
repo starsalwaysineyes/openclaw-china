@@ -56,7 +56,8 @@
   "dependencies": {
     "@openclaw-china/dingtalk": "0.1.14",
     "@openclaw-china/feishu": "0.1.5",
-    "@openclaw-china/wecom": "0.1.3"
+    "@openclaw-china/wecom": "0.1.3",
+    "@openclaw-china/wecom-app": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

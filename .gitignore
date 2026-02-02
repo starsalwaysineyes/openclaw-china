@@ -49,3 +49,6 @@ Thumbs.db
 
 doc/reference-projects/
 
+test-strip-markdown.mjs
+extensions/wecom-app/test-connection.mjs
+extensions/wecom-app/test-webhook.mjs

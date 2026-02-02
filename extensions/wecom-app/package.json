@@ -1,0 +1,117 @@
+{
+  "name": "@openclaw-china/wecom-app",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Openclaw WeCom Self-built Application (企业微信自建应用) channel plugin",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "moltbot.plugin.json",
+    "clawdbot.plugin.json",
+    "openclaw.plugin.json"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "channel": {
+      "id": "wecom-app",
+      "label": "WeCom App",
+      "selectionLabel": "WeCom Self-built App (企微自建应用)",
+      "docsPath": "/channels/wecom-app",
+      "blurb": "企业微信自建应用，支持主动发送消息",
+      "aliases": [
+        "qywx-app",
+        "企微自建应用"
+      ],
+      "order": 84
+    },
+    "install": {
+      "npmSpec": "@openclaw-china/wecom-app",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  },
+  "moltbot": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "channel": {
+      "id": "wecom-app",
+      "label": "WeCom App",
+      "selectionLabel": "WeCom Self-built App (企微自建应用)",
+      "docsPath": "/channels/wecom-app",
+      "blurb": "企业微信自建应用，支持主动发送消息",
+      "aliases": [
+        "qywx-app",
+        "企微自建应用"
+      ],
+      "order": 84
+    },
+    "install": {
+      "npmSpec": "@openclaw-china/wecom-app",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  },
+  "clawdbot": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "channel": {
+      "id": "wecom-app",
+      "label": "WeCom App",
+      "selectionLabel": "WeCom Self-built App (企微自建应用)",
+      "docsPath": "/channels/wecom-app",
+      "blurb": "企业微信自建应用，支持主动发送消息",
+      "aliases": [
+        "qywx-app",
+        "企微自建应用"
+      ],
+      "order": 84
+    },
+    "install": {
+      "npmSpec": "@openclaw-china/wecom-app",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "release": "npm run build && npm publish",
+    "release:patch": "npm run build && npm version patch && npm publish",
+    "release:minor": "npm run build && npm version minor && npm publish",
+    "release:major": "npm run build && npm version major && npm publish"
+  },
+  "dependencies": {
+    "@openclaw-china/shared": "0.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "fast-check": "^3.22.0",
+    "tsup": "^8.2.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "zod": "^3.23.0"
+  },
+  "peerDependencies": {
+    "moltbot": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "moltbot": {
+      "optional": true
+    }
+  },
+  "private": false
+}

@@ -1,0 +1,647 @@
+/**
+ * 企业微信自建应用 Webhook 处理
+ */
+import type { IncomingMessage, ServerResponse } from "node:http";
+import crypto from "node:crypto";
+
+import { createLogger, type Logger } from "@openclaw-china/shared";
+
+import type { ResolvedWecomAppAccount, WecomAppInboundMessage } from "./types.js";
+import type { PluginConfig } from "./config.js";
+import {
+  decryptWecomAppEncrypted,
+  encryptWecomAppPlaintext,
+  verifyWecomAppSignature,
+  computeWecomAppMsgSignature,
+} from "./crypto.js";
+import { dispatchWecomAppMessage } from "./bot.js";
+import { tryGetWecomAppRuntime } from "./runtime.js";
+import { sendWecomAppMessage, stripMarkdown } from "./api.js";
+
+export type WecomAppRuntimeEnv = {
+  log?: (message: string) => void;
+  error?: (message: string) => void;
+};
+
+type WecomAppWebhookTarget = {
+  account: ResolvedWecomAppAccount;
+  config: PluginConfig;
+  runtime: WecomAppRuntimeEnv;
+  path: string;
+  statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
+};
+
+type StreamState = {
+  streamId: string;
+  msgid?: string;
+  createdAt: number;
+  updatedAt: number;
+  started: boolean;
+  finished: boolean;
+  error?: string;
+  content: string;
+};
+
+const webhookTargets = new Map<string, WecomAppWebhookTarget[]>();
+const streams = new Map<string, StreamState>();
+const msgidToStreamId = new Map<string, string>();
+
+const STREAM_TTL_MS = 10 * 60 * 1000;
+/** 增大到 500KB (用户偏好) */
+const STREAM_MAX_BYTES = 512_000;
+const INITIAL_STREAM_WAIT_MS = 800;
+
+function normalizeWebhookPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "/";
+  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  if (withSlash.length > 1 && withSlash.endsWith("/")) return withSlash.slice(0, -1);
+  return withSlash;
+}
+
+function pruneStreams(): void {
+  const cutoff = Date.now() - STREAM_TTL_MS;
+  for (const [id, state] of streams.entries()) {
+    if (state.updatedAt < cutoff) {
+      streams.delete(id);
+    }
+  }
+  for (const [msgid, id] of msgidToStreamId.entries()) {
+    if (!streams.has(id)) {
+      msgidToStreamId.delete(msgid);
+    }
+  }
+}
+
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return text;
+  const slice = buf.subarray(buf.length - maxBytes);
+  return slice.toString("utf8");
+}
+
+function jsonOk(res: ServerResponse, body: unknown): void {
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.end(JSON.stringify(body));
+}
+
+async function readRawBody(req: IncomingMessage, maxBytes: number) {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  return await new Promise<{ ok: boolean; raw?: string; error?: string }>((resolve) => {
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        resolve({ ok: false, error: "payload too large" });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        if (!raw.trim()) {
+          resolve({ ok: false, error: "empty payload" });
+          return;
+        }
+        resolve({ ok: true, raw });
+      } catch (err) {
+        resolve({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+    req.on("error", (err) => {
+      resolve({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    });
+  });
+}
+
+/**
+ * 解析 XML 格式数据
+ * 企业微信 POST 请求使用 XML 格式
+ */
+function parseXmlBody(xml: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  // 匹配 CDATA 格式: <Tag><![CDATA[value]]></Tag>
+  const cdataRegex = /<(\w+)><!\[CDATA\[([\s\S]*?)\]\]><\/\1>/g;
+  let match;
+  while ((match = cdataRegex.exec(xml)) !== null) {
+    result[match[1]!] = match[2]!;
+  }
+  // 匹配简单格式: <Tag>value</Tag>
+  const simpleRegex = /<(\w+)>([^<]*)<\/\1>/g;
+  while ((match = simpleRegex.exec(xml)) !== null) {
+    if (!result[match[1]!]) result[match[1]!] = match[2]!;
+  }
+  return result;
+}
+
+/**
+ * 判断是否是 XML 格式
+ */
+function isXmlFormat(raw: string): boolean {
+  const trimmed = raw.trim();
+  return trimmed.startsWith("<") && trimmed.endsWith(">");
+}
+
+function buildEncryptedJsonReply(params: {
+  account: ResolvedWecomAppAccount;
+  plaintextJson: unknown;
+  nonce: string;
+  timestamp: string;
+}): { encrypt: string; msgsignature: string; timestamp: string; nonce: string } {
+  const plaintext = JSON.stringify(params.plaintextJson ?? {});
+  const encrypt = encryptWecomAppPlaintext({
+    encodingAESKey: params.account.encodingAESKey ?? "",
+    receiveId: params.account.receiveId ?? "",
+    plaintext,
+  });
+  const msgsignature = computeWecomAppMsgSignature({
+    token: params.account.token ?? "",
+    timestamp: params.timestamp,
+    nonce: params.nonce,
+    encrypt,
+  });
+  return {
+    encrypt,
+    msgsignature,
+    timestamp: params.timestamp,
+    nonce: params.nonce,
+  };
+}
+
+function resolveQueryParams(req: IncomingMessage): URLSearchParams {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  return url.searchParams;
+}
+
+function resolvePath(req: IncomingMessage): string {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  return normalizeWebhookPath(url.pathname || "/");
+}
+
+function resolveSignatureParam(params: URLSearchParams): string {
+  return params.get("msg_signature") ?? params.get("msgsignature") ?? params.get("signature") ?? "";
+}
+
+function buildStreamPlaceholderReply(streamId: string): { msgtype: "stream"; stream: { id: string; finish: boolean; content: string } } {
+  return {
+    msgtype: "stream",
+    stream: {
+      id: streamId,
+      finish: false,
+      content: "稍等~",
+    },
+  };
+}
+
+function buildStreamReplyFromState(state: StreamState): { msgtype: "stream"; stream: { id: string; finish: boolean; content: string } } {
+  const content = truncateUtf8Bytes(state.content, STREAM_MAX_BYTES);
+  return {
+    msgtype: "stream",
+    stream: {
+      id: state.streamId,
+      finish: state.finished,
+      content,
+    },
+  };
+}
+
+function createStreamId(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+/**
+ * 解析解密后的明文消息
+ * 支持 JSON 和 XML 两种格式
+ */
+function parseWecomAppPlainMessage(raw: string): WecomAppInboundMessage {
+  const trimmed = raw.trim();
+  
+  // XML 格式
+  if (trimmed.startsWith("<") && trimmed.endsWith(">")) {
+    const xmlData = parseXmlBody(trimmed);
+    // 映射 XML 字段到标准字段
+    return {
+      msgtype: xmlData.MsgType,
+      MsgType: xmlData.MsgType,
+      msgid: xmlData.MsgId,
+      MsgId: xmlData.MsgId,
+      content: xmlData.Content,
+      Content: xmlData.Content,
+      from: xmlData.FromUserName ? { userid: xmlData.FromUserName } : undefined,
+      FromUserName: xmlData.FromUserName,
+      ToUserName: xmlData.ToUserName,
+      CreateTime: xmlData.CreateTime,
+      AgentID: xmlData.AgentID,
+      // 事件类型
+      Event: xmlData.Event,
+    } as WecomAppInboundMessage;
+  }
+  
+  // JSON 格式
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed as WecomAppInboundMessage;
+  } catch {
+    return {};
+  }
+}
+
+async function waitForStreamContent(streamId: string, maxWaitMs: number): Promise<void> {
+  if (maxWaitMs <= 0) return;
+  const startedAt = Date.now();
+  await new Promise<void>((resolve) => {
+    const tick = () => {
+      const state = streams.get(streamId);
+      if (!state) return resolve();
+      if (state.error || state.finished || state.content.trim()) return resolve();
+      if (Date.now() - startedAt >= maxWaitMs) return resolve();
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+}
+
+function appendStreamContent(state: StreamState, nextText: string): void {
+  const content = state.content ? `${state.content}\n\n${nextText}`.trim() : nextText.trim();
+  state.content = truncateUtf8Bytes(content, STREAM_MAX_BYTES);
+  state.updatedAt = Date.now();
+}
+
+function buildLogger(target: WecomAppWebhookTarget): Logger {
+  return createLogger("wecom-app", {
+    log: target.runtime.log,
+    error: target.runtime.error,
+  });
+}
+
+/**
+ * 注册 Webhook 目标
+ */
+export function registerWecomAppWebhookTarget(target: WecomAppWebhookTarget): () => void {
+  const key = normalizeWebhookPath(target.path);
+  const normalizedTarget = { ...target, path: key };
+  const existing = webhookTargets.get(key) ?? [];
+  const next = [...existing, normalizedTarget];
+  webhookTargets.set(key, next);
+  return () => {
+    const updated = (webhookTargets.get(key) ?? []).filter((entry) => entry !== normalizedTarget);
+    if (updated.length > 0) webhookTargets.set(key, updated);
+    else webhookTargets.delete(key);
+  };
+}
+
+/**
+ * 处理企业微信自建应用 Webhook 请求
+ */
+export async function handleWecomAppWebhookRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  pruneStreams();
+
+  const path = resolvePath(req);
+  const targets = webhookTargets.get(path);
+  if (!targets || targets.length === 0) return false;
+
+  const query = resolveQueryParams(req);
+  const timestamp = query.get("timestamp") ?? "";
+  const nonce = query.get("nonce") ?? "";
+  const signature = resolveSignatureParam(query);
+
+  const primary = targets[0]!;
+  const logger = buildLogger(primary);
+  logger.debug(`incoming ${req.method} request on ${path} (timestamp=${timestamp}, nonce=${nonce})`);
+
+  // GET 请求 - URL 验证
+  if (req.method === "GET") {
+    const echostr = query.get("echostr") ?? "";
+    if (!timestamp || !nonce || !signature || !echostr) {
+      res.statusCode = 400;
+      res.end("missing query params");
+      return true;
+    }
+
+    const target = targets.find((candidate) => {
+      if (!candidate.account.configured || !candidate.account.token) return false;
+      return verifyWecomAppSignature({
+        token: candidate.account.token,
+        timestamp,
+        nonce,
+        encrypt: echostr,
+        signature,
+      });
+    });
+
+    if (!target || !target.account.encodingAESKey) {
+      res.statusCode = 401;
+      res.end("unauthorized");
+      return true;
+    }
+
+    try {
+      const plain = decryptWecomAppEncrypted({
+        encodingAESKey: target.account.encodingAESKey,
+        receiveId: target.account.receiveId,
+        encrypt: echostr,
+      });
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end(plain);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.statusCode = 400;
+      res.end(msg || "decrypt failed");
+      return true;
+    }
+  }
+
+  if (req.method !== "POST") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET, POST");
+    res.end("Method Not Allowed");
+    return true;
+  }
+
+  if (!timestamp || !nonce || !signature) {
+    res.statusCode = 400;
+    res.end("missing query params");
+    return true;
+  }
+
+  const body = await readRawBody(req, 1024 * 1024);
+  if (!body.ok || !body.raw) {
+    res.statusCode = body.error === "payload too large" ? 413 : 400;
+    res.end(body.error ?? "invalid payload");
+    return true;
+  }
+
+  const rawBody = body.raw;
+  let encrypt = "";
+  let msgSignature = signature;
+  let msgTimestamp = timestamp;
+  let msgNonce = nonce;
+
+  if (isXmlFormat(rawBody)) {
+    // XML 格式 - 企业微信标准格式
+    const xmlData = parseXmlBody(rawBody);
+    encrypt = xmlData.Encrypt ?? "";
+    // 优先使用 XML 中的签名参数，回退到 URL query 参数
+    msgSignature = xmlData.MsgSignature ?? signature;
+    msgTimestamp = xmlData.TimeStamp ?? timestamp;
+    msgNonce = xmlData.Nonce ?? nonce;
+    logger.debug(`parsed XML: encrypt=${encrypt.slice(0, 20)}..., sig=${msgSignature.slice(0, 10)}...`);
+  } else {
+    // JSON 格式 - 兼容旧格式
+    try {
+      const record = JSON.parse(rawBody) as Record<string, unknown>;
+      encrypt = String(record.encrypt ?? record.Encrypt ?? "");
+    } catch {
+      res.statusCode = 400;
+      res.end("invalid payload format");
+      return true;
+    }
+  }
+
+  if (!encrypt) {
+    res.statusCode = 400;
+    res.end("missing encrypt");
+    return true;
+  }
+
+  const target = targets.find((candidate) => {
+    if (!candidate.account.token) return false;
+    return verifyWecomAppSignature({
+      token: candidate.account.token,
+      timestamp: msgTimestamp,
+      nonce: msgNonce,
+      encrypt,
+      signature: msgSignature,
+    });
+  });
+
+  if (!target) {
+    res.statusCode = 401;
+    res.end("unauthorized");
+    return true;
+  }
+
+  if (!target.account.configured || !target.account.token || !target.account.encodingAESKey) {
+    res.statusCode = 500;
+    res.end("wecom-app not configured");
+    return true;
+  }
+
+  let plain: string;
+  try {
+    plain = decryptWecomAppEncrypted({
+      encodingAESKey: target.account.encodingAESKey,
+      receiveId: target.account.receiveId,
+      encrypt,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.statusCode = 400;
+    res.end(msg || "decrypt failed");
+    return true;
+  }
+
+  const msg = parseWecomAppPlainMessage(plain);
+  target.statusSink?.({ lastInboundAt: Date.now() });
+
+  const msgtype = String(msg.msgtype ?? msg.MsgType ?? "").toLowerCase();
+  const msgid = msg.msgid ?? msg.MsgId ? String(msg.msgid ?? msg.MsgId) : undefined;
+
+  // 流式刷新请求
+  if (msgtype === "stream") {
+    const streamId = String((msg as { stream?: { id?: string } }).stream?.id ?? "").trim();
+    const state = streamId ? streams.get(streamId) : undefined;
+    const reply = state
+      ? buildStreamReplyFromState(state)
+      : buildStreamReplyFromState({
+          streamId: streamId || "unknown",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          started: true,
+          finished: true,
+          content: "",
+        });
+    jsonOk(
+      res,
+      buildEncryptedJsonReply({
+        account: target.account,
+        plaintextJson: reply,
+        nonce: msgNonce,
+        timestamp: msgTimestamp,
+      })
+    );
+    return true;
+  }
+
+  // 重复消息
+  if (msgid && msgidToStreamId.has(msgid)) {
+    const streamId = msgidToStreamId.get(msgid) ?? "";
+    const reply = buildStreamPlaceholderReply(streamId);
+    jsonOk(
+      res,
+      buildEncryptedJsonReply({
+        account: target.account,
+        plaintextJson: reply,
+        nonce: msgNonce,
+        timestamp: msgTimestamp,
+      })
+    );
+    return true;
+  }
+
+  // 事件消息
+  if (msgtype === "event") {
+    const eventtype = String(
+      (msg as { event?: { eventtype?: string }; Event?: string }).event?.eventtype ??
+      (msg as { Event?: string }).Event ?? ""
+    ).toLowerCase();
+
+    if (eventtype === "enter_chat" || eventtype === "subscribe") {
+      const welcome = target.account.config.welcomeText?.trim();
+      if (welcome && target.account.canSendActive) {
+        // 使用主动发送欢迎消息
+        const senderId = msg.from?.userid?.trim() ?? (msg as { FromUserName?: string }).FromUserName?.trim();
+        if (senderId) {
+          sendWecomAppMessage(target.account, { userId: senderId }, welcome).catch((err) => {
+            logger.error(`failed to send welcome message: ${String(err)}`);
+          });
+        }
+      }
+      jsonOk(
+        res,
+        buildEncryptedJsonReply({
+          account: target.account,
+          plaintextJson: {},
+          nonce: msgNonce,
+          timestamp: msgTimestamp,
+        })
+      );
+      return true;
+    }
+
+    jsonOk(
+      res,
+      buildEncryptedJsonReply({
+        account: target.account,
+        plaintextJson: {},
+        nonce: msgNonce,
+        timestamp: msgTimestamp,
+      })
+    );
+    return true;
+  }
+
+  const streamId = createStreamId();
+  if (msgid) msgidToStreamId.set(msgid, streamId);
+  streams.set(streamId, {
+    streamId,
+    msgid,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    started: false,
+    finished: false,
+    content: "",
+  });
+
+  const core = tryGetWecomAppRuntime();
+
+  if (core) {
+    const state = streams.get(streamId);
+    if (state) state.started = true;
+
+    // 解析发送者信息用于主动发送
+    const senderId = msg.from?.userid?.trim() ?? (msg as { FromUserName?: string }).FromUserName?.trim();
+    const chatid = msg.chatid?.trim();
+
+    const hooks = {
+      onChunk: async (text: string) => {
+        const current = streams.get(streamId);
+        if (!current) return;
+        appendStreamContent(current, text);
+        target.statusSink?.({ lastOutboundAt: Date.now() });
+
+        // 如果支持主动发送，使用主动发送 API
+        if (target.account.canSendActive && (senderId || chatid)) {
+          try {
+            await sendWecomAppMessage(
+              target.account,
+              chatid ? { chatid } : { userId: senderId },
+              stripMarkdown(text)
+            );
+          } catch (err) {
+            logger.error(`failed to send active message: ${String(err)}`);
+          }
+        }
+      },
+      onError: (err: unknown) => {
+        const current = streams.get(streamId);
+        if (current) {
+          current.error = err instanceof Error ? err.message : String(err);
+          current.content = current.content || `Error: ${current.error}`;
+          current.finished = true;
+          current.updatedAt = Date.now();
+        }
+        logger.error(`wecom-app agent failed: ${String(err)}`);
+      },
+    };
+
+    dispatchWecomAppMessage({
+      cfg: target.config,
+      account: target.account,
+      msg,
+      core,
+      hooks,
+      log: target.runtime.log,
+      error: target.runtime.error,
+    })
+      .then(() => {
+        const current = streams.get(streamId);
+        if (current) {
+          current.finished = true;
+          current.updatedAt = Date.now();
+        }
+      })
+      .catch((err) => {
+        const current = streams.get(streamId);
+        if (current) {
+          current.error = err instanceof Error ? err.message : String(err);
+          current.content = current.content || `Error: ${current.error}`;
+          current.finished = true;
+          current.updatedAt = Date.now();
+        }
+        logger.error(`wecom-app agent failed: ${String(err)}`);
+      });
+  } else {
+    const state = streams.get(streamId);
+    if (state) {
+      state.finished = true;
+      state.updatedAt = Date.now();
+    }
+  }
+
+  await waitForStreamContent(streamId, INITIAL_STREAM_WAIT_MS);
+  const state = streams.get(streamId);
+  const initialReply = state && (state.content.trim() || state.error)
+    ? buildStreamReplyFromState(state)
+    : buildStreamPlaceholderReply(streamId);
+
+  jsonOk(
+    res,
+    buildEncryptedJsonReply({
+      account: target.account,
+      plaintextJson: initialReply,
+      nonce: msgNonce,
+      timestamp: msgTimestamp,
+    })
+  );
+
+  return true;
+}

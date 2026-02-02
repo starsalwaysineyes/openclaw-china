@@ -10,31 +10,35 @@
 |------|:----:|
 | 钉钉 | ✅ 可用 |
 | 飞书 | ✅ 可用 |
-| 企业微信 | ✅ 可用 |
+| 企业微信（智能机器人） | ✅ 可用 |
+| 企业微信（自建应用） | ✅ 可用 |
 | QQ 机器人 | 🚧 开发中 |
 
 ## 功能支持
 
 较多功能支持仍在努力开发中~
 
-| 功能 | 钉钉 | 飞书 | 企业微信 |
-|------|:----:|:----:|:--------:|
-| 文本消息 | ✅ | ✅ | ✅ |
-| Markdown | ✅ | ✅ | ✅ |
-| 流式响应 | ✅ | 🚧 开发中 | ✅ stream 回调 |
-| 图片/文件 | ✅  | 🚧 开发中 | ✅ 仅接收 |
-| 语音消息 | ✅  | 🚧 开发中 | ✅ 仅接收（语音文本） |
-| 私聊 | ✅ | ✅ | ✅ |
-| 群聊 | ✅ | ✅ | ✅ |
-| @机器人检测 | ✅ | ✅ | ❌（未显式解析@） |
-| 多账户 | 🚧 开发中 | 🚧 开发中 | ✅ |
-| 连接方式 | Stream 长连接 | WebSocket 长连接 | HTTPS 回调 |
+| 功能 | 钉钉 | 飞书 | 企业微信智能机器人 | 企业微信自建应用 |
+|------|:----:|:----:|:------------------:|:----------------:|
+| 文本消息 | ✅ | ✅ | ✅ | ✅ |
+| Markdown | ✅ | ✅ | ✅ | ✅ |
+| 流式响应 | ✅ | 🚧 开发中 | ✅ stream 回调 | ❌ |
+| 图片/文件 | ✅  | 🚧 开发中 | ✅ 仅接收 | ✅ 仅接收 |
+| 语音消息 | ✅  | 🚧 开发中 | ✅ 仅接收（语音文本） | ✅ 仅接收 |
+| 私聊 | ✅ | ✅ | ✅ | ✅ |
+| 群聊 | ✅ | ✅ | ✅ | ✅ |
+| @机器人检测 | ✅ | ✅ | ❌（未显式解析@） | ❌ |
+| 多账户 | 🚧 开发中 | 🚧 开发中 | ✅ | ✅ |
+| 主动发送消息 | ❌ | ❌ | ❌ | ✅ |
+| 连接方式 | Stream 长连接 | WebSocket 长连接 | HTTPS 回调 | HTTPS 回调 |
 
 > 💡 **钉钉 AI Card** 支持打字机效果的流式输出，体验最佳。启用方式：`enableAICard: true`
 >
 > 💡 **飞书 Markdown 卡片** 启用方式：`sendMarkdownAsCard: true`
 >
-> 💡 **企业微信** 仅支持被动回复模式，不支持主动发送消息
+> 💡 **企业微信智能机器人** 仅支持被动回复模式，不支持主动发送消息
+>
+> 💡 **企业微信自建应用** 支持主动发送消息，需要配置 `corpId`、`corpSecret`、`agentId`
 
 ## 快速开始
 
@@ -151,7 +155,7 @@ openclaw config set channels.feishu '{
 }' --json
 ```
 
-#### 企业微信
+#### 企业微信（智能机器人）
 
 > 企业微信智能机器人（API 模式）通过公网 HTTPS 回调接收消息，仅支持被动回复
 
@@ -169,6 +173,46 @@ openclaw config set channels.wecom '{
 - `webhookPath` 必须为公网 HTTPS 可访问路径（如 `https://your.domain/wecom`）
 - `encodingAESKey` 必须为 43 位字符
 - 如遇回调校验失败，先确认 Token/EncodingAESKey 与后台一致
+
+#### 企业微信（自建应用）
+
+> 📖 **[企业微信自建应用配置指南](doc/guides/wecom-app/configuration.md)** — 支持主动发送消息
+
+企业微信自建应用支持主动发送消息，需要额外配置 `corpId`、`corpSecret`、`agentId`：
+
+```bash
+openclaw config set channels.wecom-app '{
+  "enabled": true,
+  "webhookPath": "/wecom-app",
+  "token": "your-token",
+  "encodingAESKey": "your-43-char-encoding-aes-key",
+  "corpId": "your-corp-id",
+  "corpSecret": "your-app-secret",
+  "agentId": 1000002
+}' --json
+```
+
+**Windows 用户**（CMD 不支持单引号 JSON）：
+
+```cmd
+openclaw config set channels.wecom-app.enabled true
+openclaw config set channels.wecom-app.webhookPath /wecom-app
+openclaw config set channels.wecom-app.token your-token
+openclaw config set channels.wecom-app.encodingAESKey your-43-char-encoding-aes-key
+openclaw config set channels.wecom-app.corpId your-corp-id
+openclaw config set channels.wecom-app.corpSecret your-app-secret
+openclaw config set channels.wecom-app.agentId 1000002
+```
+
+**与智能机器人的区别**
+
+| 功能 | 智能机器人 (wecom) | 自建应用 (wecom-app) |
+|------|:------------------:|:--------------------:|
+| 被动回复 | ✅ | ✅ |
+| 主动发送消息 | ❌ | ✅ |
+| 需要 corpSecret | ❌ | ✅ |
+| 需要 IP 白名单 | ❌ | ✅ |
+| 配置复杂度 | 简单 | 中等 |
 
 ### 3) 重启 Gateway
 
@@ -256,6 +300,15 @@ openclaw plugins install -l ./packages/channels
       "webhookPath": "/wecom",
       "token": "your-token",
       "encodingAESKey": "your-43-char-encoding-aes-key"
+    },
+    "wecom-app": {
+      "enabled": true,
+      "webhookPath": "/wecom-app",
+      "token": "your-token",
+      "encodingAESKey": "your-43-char-encoding-aes-key",
+      "corpId": "your-corp-id",
+      "corpSecret": "your-app-secret",
+      "agentId": 1000002
     }
   }
 }
