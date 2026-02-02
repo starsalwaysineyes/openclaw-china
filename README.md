@@ -270,9 +270,11 @@ openclaw plugins install -l ./packages/channels
 **欢迎同学们一起开发~**
 
 二群：
+
 <img width="611" height="854" alt="4d16a9f91778b4ad0153c40733ae3042" src="https://github.com/user-attachments/assets/607c9df3-4569-4534-81e4-2fd4579dd504" />
 
 一群（已满）：
+
 <img width="611" height="854" alt="4d16a9f91778b4ad0153c40733ae3042" src="https://github.com/user-attachments/assets/563160be-78ac-4cd5-b01c-d83c77e5e4b8" />
 
 
