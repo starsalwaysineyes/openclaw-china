@@ -106,7 +106,7 @@ openclaw config set channels.dingtalk '{
   "enabled": true,
   "clientId": "dingxxxxxx",
   "clientSecret": "your-app-secret",
-  "enableAICard": true
+  "enableAICard": false
 }' --json
 ```
 
@@ -147,7 +147,9 @@ openclaw:
 openclaw config set channels.feishu '{
   "enabled": true,
   "appId": "cli_xxxxxx",
-  "appSecret": "your-app-secret"
+  "appSecret": "your-app-secret",
+  "sendMarkdownAsCard": true
+
 }' --json
 ```
 
