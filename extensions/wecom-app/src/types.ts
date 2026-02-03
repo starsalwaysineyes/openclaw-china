@@ -44,6 +44,9 @@ export type WecomAppAccountConfig = {
     keepDays?: number;
   };
 
+  /** 媒体文件大小限制 (MB)，默认 100 */
+  maxFileSizeMB?: number;
+
   /** 欢迎文本 */
   welcomeText?: string;
 

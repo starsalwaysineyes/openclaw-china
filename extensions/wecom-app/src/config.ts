@@ -26,6 +26,9 @@ const WecomAppAccountSchema = z.object({
   corpSecret: z.string().optional(),
   agentId: z.number().optional(),
 
+  // 媒体文件大小限制 (MB)
+  maxFileSizeMB: z.number().optional(),
+
   // 入站媒体（图片/文件）落盘设置
   inboundMedia: z
     .object({
@@ -82,6 +85,7 @@ export const WecomAppConfigJsonSchema = {
       groupPolicy: { type: "string", enum: ["open", "allowlist", "disabled"] },
       groupAllowFrom: { type: "array", items: { type: "string" } },
       requireMention: { type: "boolean" },
+      maxFileSizeMB: { type: "number" },
       defaultAccount: { type: "string" },
       accounts: {
         type: "object",
@@ -114,6 +118,7 @@ export const WecomAppConfigJsonSchema = {
             groupPolicy: { type: "string", enum: ["open", "allowlist", "disabled"] },
             groupAllowFrom: { type: "array", items: { type: "string" } },
             requireMention: { type: "boolean" },
+            maxFileSizeMB: { type: "number" },
           },
         },
       },
@@ -251,7 +256,7 @@ export function resolveGroupAllowFrom(config: WecomAppAccountConfig): string[] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Inbound media settings
+// 入站媒体设置
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_INBOUND_MEDIA_DIR = "/root/.openclaw/media/wecom-app/inbound";
@@ -276,4 +281,9 @@ export function resolveInboundMediaMaxBytes(config: WecomAppAccountConfig): numb
 export function resolveInboundMediaKeepDays(config: WecomAppAccountConfig): number {
   const v = config.inboundMedia?.keepDays;
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : DEFAULT_INBOUND_MEDIA_KEEP_DAYS;
+}
+
+export function resolveMaxFileSizeMB(config: WecomAppAccountConfig): number {
+  const v = config.maxFileSizeMB;
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 100;
 }

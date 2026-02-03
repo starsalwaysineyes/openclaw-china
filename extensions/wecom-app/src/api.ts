@@ -4,9 +4,48 @@
  * 提供 Access Token 缓存和主动发送消息能力
  */
 import type { ResolvedWecomAppAccount, WecomAppSendTarget, AccessTokenCacheEntry } from "./types.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, unlink } from "node:fs/promises";
 import { basename, join, extname } from "node:path";
+import { tmpdir } from "node:os";
 
+/** 下载超时时间（毫秒） */
+const DOWNLOAD_TIMEOUT = 120_000;
+
+/**
+ * 文件大小超过限制时抛出的错误
+ */
+export class FileSizeLimitError extends Error {
+  public readonly actualSize: number;
+  public readonly limitSize: number;
+  public readonly msgType: string;
+
+  constructor(actualSize: number, limitSize: number, msgType: string) {
+    super(`File size ${actualSize} bytes exceeds limit ${limitSize} bytes for ${msgType}`);
+    this.name = "FileSizeLimitError";
+    this.actualSize = actualSize;
+    this.limitSize = limitSize;
+    this.msgType = msgType;
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, FileSizeLimitError);
+    }
+  }
+}
+
+/**
+ * 下载超时时抛出的错误
+ */
+export class TimeoutError extends Error {
+  public readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Download timed out after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+    this.timeoutMs = timeoutMs;
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, TimeoutError);
+    }
+  }
+}
 
 /** Access Token 缓存 (key: corpId:agentId) */
 const accessTokenCache = new Map<string, AccessTokenCacheEntry>();
@@ -109,7 +148,7 @@ export function stripMarkdown(text: string): string {
 }
 
 /**
- * 获取 Access Token (带缓存)
+ * 获取 Access Token（带缓存）
  */
 export async function getAccessToken(account: ResolvedWecomAppAccount): Promise<string> {
   if (!account.corpId || !account.corpSecret) {
@@ -170,7 +209,7 @@ export type SendMessageResult = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Inbound media download (media_id -> local file)
+// 入站媒体下载 (media_id -> 本地文件)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type SavedInboundMedia = {
@@ -227,95 +266,151 @@ function todayDirName(): string {
 }
 
 /**
+ * 清理临时文件（尽力而为，从不抛出错误）
+ */
+export async function cleanupFile(filePath: string): Promise<void> {
+  try {
+    await unlink(filePath);
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+/**
+ * 获取企业微信媒体文件的临时目录
+ */
+function getWecomTempDir(): string {
+  return join(tmpdir(), "wecom-app-media");
+}
+
+/**
  * 下载企业微信 media_id 到本地文件
  * - 优先用于入站 image/file 的落盘
+ * - 支持 120 秒超时
+ * - 支持 Content-Length 预检和流式下载实时监控
+ * - 默认保存到系统临时目录，需手动调用 cleanupFile() 清理
  */
 export async function downloadWecomMediaToFile(
   account: ResolvedWecomAppAccount,
   mediaId: string,
-  opts: { dir: string; maxBytes: number; prefix?: string }
+  opts: { dir?: string; maxBytes: number; prefix?: string }
 ): Promise<SavedInboundMedia> {
   const raw = String(mediaId ?? "").trim();
   if (!raw) return { ok: false, error: "mediaId/url is empty" };
 
-  // Support both WeCom media_id and direct http(s) url.
-  // - media_id: use qyapi media/get (requires corpId/corpSecret for access_token)
-  // - url: download directly (no auth needed)
+  // 支持企业微信 media_id 和直接的 http(s) URL
   const isHttp = raw.startsWith("http://") || raw.startsWith("https://");
+
+  // 设置超时中止控制器
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT);
 
   let resp: Response;
   let contentType: string | undefined;
   let filenameFromHeader: string | undefined;
 
-  if (isHttp) {
-    resp = await fetch(raw);
-    if (!resp.ok) {
-      return { ok: false, error: `download failed: HTTP ${resp.status}` };
-    }
-    contentType = resp.headers.get("content-type") || undefined;
-    filenameFromHeader = undefined;
-  } else {
-    // media_id download requires corpId/corpSecret (for access_token), but NOT agentId
-    if (!account.corpId || !account.corpSecret) {
-      return { ok: false, error: "Account not configured for media download (missing corpId/corpSecret)" };
-    }
-    const safeMediaId = raw;
-    const token = await getAccessToken(account);
-    const url = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${encodeURIComponent(token)}&media_id=${encodeURIComponent(safeMediaId)}`;
+  try {
+    if (isHttp) {
+      resp = await fetch(raw, { signal: controller.signal });
+      if (!resp.ok) {
+        return { ok: false, error: `download failed: HTTP ${resp.status}` };
+      }
+      contentType = resp.headers.get("content-type") || undefined;
+      filenameFromHeader = undefined;
+    } else {
+      // media_id 下载需要 corpId/corpSecret（用于获取 access_token），但不需要 agentId
+      if (!account.corpId || !account.corpSecret) {
+        return { ok: false, error: "Account not configured for media download (missing corpId/corpSecret)" };
+      }
+      const safeMediaId = raw;
+      const token = await getAccessToken(account);
+      const url = `https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token=${encodeURIComponent(token)}&media_id=${encodeURIComponent(safeMediaId)}`;
 
-    resp = await fetch(url);
-    if (!resp.ok) {
-      return { ok: false, error: `media/get failed: HTTP ${resp.status}` };
-    }
+      resp = await fetch(url, { signal: controller.signal });
+      if (!resp.ok) {
+        return { ok: false, error: `media/get failed: HTTP ${resp.status}` };
+      }
 
-    contentType = resp.headers.get("content-type") || undefined;
-    const cd = resp.headers.get("content-disposition");
-    filenameFromHeader = parseContentDispositionFilename(cd);
+      contentType = resp.headers.get("content-type") || undefined;
+      const cd = resp.headers.get("content-disposition");
+      filenameFromHeader = parseContentDispositionFilename(cd);
 
-    // 企业微信失败时可能返回 JSON（errcode/errmsg）
-    if ((contentType ?? "").includes("application/json")) {
-      try {
-        const j = (await resp.json()) as { errcode?: number; errmsg?: string };
-        return { ok: false, error: `media/get returned json: errcode=${j?.errcode} errmsg=${j?.errmsg}` };
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      // 企业微信失败时可能返回 JSON（errcode/errmsg）
+      if ((contentType ?? "").includes("application/json")) {
+        try {
+          const j = (await resp.json()) as { errcode?: number; errmsg?: string };
+          return { ok: false, error: `media/get returned json: errcode=${j?.errcode} errmsg=${j?.errmsg}` };
+        } catch (err) {
+          return { ok: false, error: err instanceof Error ? err.message : String(err) };
+        }
       }
     }
+
+    // 预检查 Content-Length（如果可用）
+    const contentLength = resp.headers.get("content-length");
+    if (contentLength && opts.maxBytes > 0) {
+      const declaredSize = parseInt(contentLength, 10);
+      if (!Number.isNaN(declaredSize) && declaredSize > opts.maxBytes) {
+        throw new FileSizeLimitError(declaredSize, opts.maxBytes, "media");
+      }
+    }
+
+    // 流式下载并监控大小
+    const reader = resp.body?.getReader();
+    if (!reader) {
+      return { ok: false, error: "Response body is not readable" };
+    }
+
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      totalSize += value.length;
+      if (opts.maxBytes > 0 && totalSize > opts.maxBytes) {
+        reader.cancel();
+        throw new FileSizeLimitError(totalSize, opts.maxBytes, "media");
+      }
+      chunks.push(value);
+    }
+
+    const buf = Buffer.concat(chunks.map(c => Buffer.from(c)));
+
+    // 默认使用临时目录
+    const baseDir = (opts.dir ?? "").trim() || getWecomTempDir();
+    await mkdir(baseDir, { recursive: true });
+
+    const prefix = (opts.prefix ?? "media").trim() || "media";
+    const timestamp = Date.now();
+    const randomSuffix = Math.random().toString(36).substring(2, 8);
+
+    const extFromMime = pickExtFromMime(contentType);
+    const extFromName = filenameFromHeader ? extname(filenameFromHeader) : (isHttp ? extname(raw.split("?")[0] || "") : "");
+    const ext = extFromName || extFromMime || ".bin";
+
+    // 简单的临时文件名，不包含子目录，便于清理
+    const filename = `${prefix}_${timestamp}_${randomSuffix}${ext}`;
+    const outPath = join(baseDir, filename);
+
+    await writeFile(outPath, buf);
+
+    return {
+      ok: true,
+      path: outPath,
+      mimeType: contentType,
+      size: buf.length,
+      filename,
+    };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new TimeoutError(DOWNLOAD_TIMEOUT);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  // 读二进制并限制大小
-  const arrayBuffer = await resp.arrayBuffer();
-  const buf = Buffer.from(arrayBuffer);
-  if (opts.maxBytes > 0 && buf.length > opts.maxBytes) {
-    return { ok: false, error: `media too large: ${buf.length} bytes (limit ${opts.maxBytes})` };
-  }
-
-  const baseDir = (opts.dir ?? "").trim();
-  if (!baseDir) return { ok: false, error: "opts.dir is empty" };
-
-  const datedDir = join(baseDir, todayDirName());
-  await mkdir(datedDir, { recursive: true });
-
-  const prefix = (opts.prefix ?? "media").trim() || "media";
-  const timestamp = Date.now();
-
-  const extFromMime = pickExtFromMime(contentType);
-  const extFromName = filenameFromHeader ? extname(filenameFromHeader) : (isHttp ? extname(raw.split("?")[0] || "") : "");
-  const ext = extFromName || extFromMime || ".bin";
-
-  const idPart = isHttp ? "url" : raw;
-  const filename = filenameFromHeader ? basename(filenameFromHeader) : `${prefix}_${timestamp}_${idPart}${ext}`;
-  const outPath = join(datedDir, filenameFromHeader ? filename : `${prefix}_${timestamp}_${idPart}${ext}`);
-
-  await writeFile(outPath, buf);
-
-  return {
-    ok: true,
-    path: outPath,
-    mimeType: contentType,
-    size: buf.length,
-    filename,
-  };
 }
 
 
@@ -360,9 +455,9 @@ export async function sendWecomAppMessage(
     };
   }
 
-  // NOTE: WeCom API requires access_token to be passed as a query parameter.
-  // This can expose the token in server logs, browser history, and referrer headers.
-  // Ensure that any logging of this URL redacts the access_token parameter.
+  // 注意：企业微信 API 要求 access_token 作为查询参数传递。
+  // 这可能会在服务器日志、浏览器历史和引用头中暴露令牌。
+  // 确保任何记录此 URL 的日志都隐藏 access_token 参数。
   const resp = await fetch(
     `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`,
     {
@@ -482,7 +577,7 @@ export async function downloadImage(imageUrl: string): Promise<{ buffer: Buffer;
   // 判断是网络 URL 还是本地路径
   if (imageUrl.startsWith('http://') || imageUrl.startsWith('https://')) {
     // 网络下载
-    console.log(`[wecom-app] Using HTTP fetch to download: ${imageUrl}`);
+    console.log(`[wecom-app] 使用 HTTP fetch 下载: ${imageUrl}`);
     const resp = await fetch(imageUrl);
     if (!resp.ok) {
       throw new Error(`Download image failed: HTTP ${resp.status}`);
@@ -494,7 +589,7 @@ export async function downloadImage(imageUrl: string): Promise<{ buffer: Buffer;
     };
   } else {
     // 本地文件读取
-    console.log(`[wecom-app] Using fs to read local file: ${imageUrl}`);
+    console.log(`[wecom-app] 使用 fs 读取本地文件: ${imageUrl}`);
     const fs = await import('fs');
     const buffer = await fs.promises.readFile(imageUrl);
     return {
@@ -817,7 +912,7 @@ export async function downloadVoice(voiceUrl: string): Promise<{ buffer: Buffer;
   // 判断是网络 URL 还是本地路径
   if (voiceUrl.startsWith('http://') || voiceUrl.startsWith('https://')) {
     // 网络下载
-    console.log(`[wecom-app] Using HTTP fetch to download voice: ${voiceUrl}`);
+    console.log(`[wecom-app] 使用 HTTP fetch 下载语音: ${voiceUrl}`);
     const resp = await fetch(voiceUrl);
     if (!resp.ok) {
       throw new Error(`Download voice failed: HTTP ${resp.status}`);
@@ -829,7 +924,7 @@ export async function downloadVoice(voiceUrl: string): Promise<{ buffer: Buffer;
     };
   } else {
     // 本地文件读取
-    console.log(`[wecom-app] Using fs to read local voice file: ${voiceUrl}`);
+    console.log(`[wecom-app] 使用 fs 读取本地语音文件: ${voiceUrl}`);
     const fs = await import('fs');
     const buffer = await fs.promises.readFile(voiceUrl);
     return {
