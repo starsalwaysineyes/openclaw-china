@@ -19,9 +19,11 @@ import {
   resolveGroupAllowFrom,
   resolveGroupPolicy,
   resolveRequireMention,
+  resolveInboundMediaEnabled,
+  resolveInboundMediaMaxBytes,
   type PluginConfig,
 } from "./config.js";
-import { sendWecomAppMessage, downloadAndSendImage } from "./api.js";
+import { sendWecomAppMessage, downloadAndSendImage, downloadWecomMediaToFile, cleanupFile } from "./api.js";
 
 export type WecomAppDispatchHooks = {
   onChunk: (text: string) => void;
@@ -81,6 +83,183 @@ export function extractWecomAppContent(msg: WecomAppInboundMessage): string {
   return msgtype ? `[${msgtype}]` : "";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 入站媒体：保存到临时目录，处理完成后清理
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function enrichInboundContentWithMedia(params: {
+  cfg: PluginConfig;
+  account: ResolvedWecomAppAccount;
+  msg: WecomAppInboundMessage;
+}): Promise<{ text: string; mediaPaths: string[]; cleanup: () => Promise<void> }> {
+  const { account, msg } = params;
+  const msgtype = String(msg.msgtype ?? msg.MsgType ?? "").toLowerCase();
+
+  const accountConfig = account?.config ?? {};
+  const enabled = resolveInboundMediaEnabled(accountConfig);
+  const maxBytes = resolveInboundMediaMaxBytes(accountConfig);
+
+  const mediaPaths: string[] = [];
+
+  // 清理函数：删除所有下载的临时文件
+  const makeResult = (text: string) => ({
+    text,
+    mediaPaths,
+    cleanup: async () => {
+      for (const p of mediaPaths) {
+        await cleanupFile(p);
+      }
+    },
+  });
+
+  if (!enabled) {
+    return makeResult(extractWecomAppContent(msg));
+  }
+
+  // 图片
+  if (msgtype === "image") {
+    try {
+      const mediaId = String((msg as { MediaId?: string }).MediaId ?? "").trim();
+      if (mediaId) {
+        const saved = await downloadWecomMediaToFile(account, mediaId, { maxBytes, prefix: "img" });
+        if (saved.ok && saved.path) {
+          mediaPaths.push(saved.path);
+          return makeResult(`[image] saved:${saved.path}`);
+        }
+        // 如果失败，回退到原始文本
+        return makeResult(`[image] (save failed) ${saved.error ?? ""}`.trim());
+      }
+
+      // 当没有提供 media_id 时，回退到基于 URL 的下载
+      const url = String((msg as { image?: { url?: string }; PicUrl?: string }).image?.url ?? (msg as { PicUrl?: string }).PicUrl ?? "").trim();
+      if (url) {
+        try {
+          const saved = await downloadWecomMediaToFile(account, url, { maxBytes, prefix: "img" });
+          if (saved.ok && saved.path) {
+            mediaPaths.push(saved.path);
+            return makeResult(`[image] saved:${saved.path}`);
+          }
+        } catch {
+          // 忽略
+        }
+      }
+
+      return makeResult(extractWecomAppContent(msg));
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      return makeResult(`[image] (download error: ${errorMsg})`);
+    }
+  }
+
+  // 文件（某些企业微信变体可能携带 MediaId，但当前类型不支持）
+  if (msgtype === "file") {
+    try {
+      const mediaId = String((msg as { MediaId?: string; mediaid?: string }).MediaId ?? (msg as { mediaid?: string }).mediaid ?? "").trim();
+      if (mediaId) {
+        const saved = await downloadWecomMediaToFile(account, mediaId, { maxBytes, prefix: "file" });
+        if (saved.ok && saved.path) {
+          mediaPaths.push(saved.path);
+          return makeResult(`[file] saved:${saved.path}`);
+        }
+        return makeResult(`[file] (save failed) ${saved.error ?? ""}`.trim());
+      }
+      return makeResult(extractWecomAppContent(msg));
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      return makeResult(`[file] (download error: ${errorMsg})`);
+    }
+  }
+
+  // 语音：下载语音文件到本地，如果有识别文本则包含
+  if (msgtype === "voice") {
+    try {
+      const mediaId = String((msg as { MediaId?: string }).MediaId ?? "").trim();
+      const recognition = String((msg as { Recognition?: string }).Recognition ?? "").trim();
+
+      if (mediaId) {
+        const saved = await downloadWecomMediaToFile(account, mediaId, { maxBytes, prefix: "voice" });
+        if (saved.ok && saved.path) {
+          mediaPaths.push(saved.path);
+          // 如果有识别文本，包含它以便 Agent 看到转录内容
+          if (recognition) {
+            return makeResult(`[voice] saved:${saved.path}\n[recognition] ${recognition}`);
+          }
+          return makeResult(`[voice] saved:${saved.path}`);
+        }
+        // 回退：如果保存失败，包含识别文本
+        if (recognition) {
+          return makeResult(`[voice] (save failed) ${saved.error ?? ""}\n[recognition] ${recognition}`.trim());
+        }
+        return makeResult(`[voice] (save failed) ${saved.error ?? ""}`.trim());
+      }
+
+      // 没有 mediaId，如果有识别文本则返回
+      if (recognition) {
+        return makeResult(`[voice]\n[recognition] ${recognition}`);
+      }
+      return makeResult(extractWecomAppContent(msg));
+    } catch (err) {
+      const recognition = String((msg as { Recognition?: string }).Recognition ?? "").trim();
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      if (recognition) {
+        return makeResult(`[voice] (download error: ${errorMsg})\n[recognition] ${recognition}`);
+      }
+      return makeResult(`[voice] (download error: ${errorMsg})`);
+    }
+  }
+
+  // 混合消息：尝试持久化图片项（如果存在）
+  if (msgtype === "mixed") {
+    try {
+      const items = (msg as { mixed?: { msg_item?: unknown } }).mixed?.msg_item;
+      if (!Array.isArray(items)) return makeResult(extractWecomAppContent(msg));
+
+      const parts: string[] = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const typed = item as any;
+        const t = String(typed.msgtype ?? "").toLowerCase();
+        if (t === "text") {
+          const c = String(typed.text?.content ?? "").trim();
+          if (c) parts.push(c);
+          continue;
+        }
+        if (t === "image") {
+          const mediaId = String(typed.image?.media_id ?? typed.MediaId ?? typed.media_id ?? "").trim();
+          if (mediaId) {
+            try {
+              const saved = await downloadWecomMediaToFile(account, mediaId, { maxBytes, prefix: "img" });
+              if (saved.ok && saved.path) {
+                mediaPaths.push(saved.path);
+                parts.push(`[image] saved:${saved.path}`);
+              } else {
+                const url = String(typed.image?.url ?? "").trim();
+                parts.push(url ? `[image] ${url}` : "[image]");
+              }
+            } catch (imgErr) {
+              const url = String(typed.image?.url ?? "").trim();
+              parts.push(url ? `[image] ${url}` : "[image]");
+            }
+          } else {
+            const url = String(typed.image?.url ?? "").trim();
+            parts.push(url ? `[image] ${url}` : "[image]");
+          }
+          continue;
+        }
+        if (t) parts.push(`[${t}]`);
+      }
+
+      const text = parts.filter(Boolean).join("\n") || "[mixed]";
+      return makeResult(text);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      return makeResult(`[mixed] (processing error: ${errorMsg})`);
+    }
+  }
+
+  return makeResult(extractWecomAppContent(msg));
+}
+
 function resolveSenderId(msg: WecomAppInboundMessage): string {
   const userid = msg.from?.userid?.trim() ?? (msg as { FromUserName?: string }).FromUserName?.trim();
   return userid || "unknown";
@@ -97,8 +276,18 @@ function resolveChatId(msg: WecomAppInboundMessage, senderId: string, chatType: 
   return senderId;
 }
 
-function buildInboundBody(msg: WecomAppInboundMessage): string {
-  return extractWecomAppContent(msg);
+async function buildInboundBody(params: {
+  cfg: PluginConfig;
+  account: ResolvedWecomAppAccount;
+  msg: WecomAppInboundMessage;
+}): Promise<{ text: string; cleanup: () => Promise<void> }> {
+  // 尽可能使用增强的消息体（将入站媒体保存到本地）
+  const enriched = await enrichInboundContentWithMedia({
+    cfg: params.cfg,
+    account: params.account,
+    msg: params.msg,
+  });
+  return { text: enriched.text, cleanup: enriched.cleanup };
 }
 
 /**
@@ -134,7 +323,7 @@ export async function dispatchWecomAppMessage(params: {
       conversationId: chatId,
       groupAllowFrom,
       requireMention,
-      // TODO: derive actual mention status from msg; default to false for safety
+      // TODO: 从消息中推导实际的提及状态；为了安全默认为 false
       mentionedBot: false,
     });
 
@@ -174,7 +363,7 @@ export async function dispatchWecomAppMessage(params: {
     peer: { kind: chatType === "group" ? "group" : "dm", id: chatId },
   });
 
-  const rawBody = buildInboundBody(msg);
+  const { text: rawBody, cleanup } = await buildInboundBody({ cfg: safeCfg, account, msg });
   const fromLabel = chatType === "group" ? `group:${chatId}` : `user:${senderId}`;
 
   const storePath = channel.session?.resolveStorePath?.(safeCfg.session?.store, {
@@ -278,6 +467,9 @@ export async function dispatchWecomAppMessage(params: {
       },
     },
   });
+
+  // 消息处理完成后清理临时媒体文件
+  await cleanup();
 }
 
 /**

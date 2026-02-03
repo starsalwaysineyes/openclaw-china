@@ -47,6 +47,9 @@ coverage/
 # OS
 Thumbs.db
 
+# Downloads (test-server media files)
+downloads/
+
 doc/reference-projects/
 
 test-strip-markdown.mjs

@@ -18,7 +18,49 @@ import {
 } from "./config.js";
 import { registerWecomAppWebhookTarget } from "./monitor.js";
 import { setWecomAppRuntime } from "./runtime.js";
-import { sendWecomAppMessage, stripMarkdown, downloadAndSendImage } from "./api.js";
+import { sendWecomAppMessage, stripMarkdown, downloadAndSendImage, downloadAndSendVoice, downloadAndSendFile } from "./api.js";
+
+/**
+ * 媒体类型
+ */
+type MediaType = "image" | "voice" | "file";
+
+/**
+ * 根据文件路径或 MIME 类型检测媒体类型
+ */
+function detectMediaType(filePath: string, mimeType?: string): MediaType {
+  // 优先使用 MIME 类型
+  if (mimeType) {
+    const mime = mimeType.split(";")[0].trim().toLowerCase();
+    if (mime.startsWith("image/")) {
+      return "image";
+    }
+    if (mime.startsWith("audio/") || mime === "audio/amr") {
+      return "voice";
+    }
+  }
+
+  // 回退到文件扩展名
+  const ext = filePath.toLowerCase().split("?")[0].split(".").pop();
+  if (!ext) {
+    return "file";
+  }
+
+  // 图片扩展名
+  const imageExts = ["jpg", "jpeg", "png", "gif", "bmp", "webp"];
+  if (imageExts.includes(ext)) {
+    return "image";
+  }
+
+  // 语音扩展名
+  const voiceExts = ["amr", "speex", "mp3", "wav"];
+  if (voiceExts.includes(ext)) {
+    return "voice";
+  }
+
+  // 默认作为文件处理
+  return "file";
+}
 
 const meta = {
   id: "wecom-app",
@@ -163,63 +205,139 @@ export const wecomAppPlugin = {
 
   /**
    * 目录解析 - 用于将 wecom-app:XXX 格式的 target 解析为可投递目标
+   *
+   * 支持的输入格式：
+   * - "wecom-app:user:xxx" → { channel: "wecom-app", to: "user:xxx" }
+   * - "wecom-app:group:xxx" → { channel: "wecom-app", to: "group:xxx" }
+   * - "wecom-app:xxx" → { channel: "wecom-app", to: "user:xxx" }
+   * - "user:xxx" → { channel: "wecom-app", to: "user:xxx" }
+   * - "group:xxx" → { channel: "wecom-app", to: "group:xxx" }
+   * - "xxx" (裸ID) → { channel: "wecom-app", to: "user:xxx" }
+   * - 带 accountId: "user:xxx@account1" → { channel: "wecom-app", accountId: "account1", to: "user:xxx" }
    */
   directory: {
     /**
-     * 解析目标地址
-     * 将 wecom-app:XXX 格式的 target 解析为可用的投递对象
+     * 检查此通道是否可以解析给定的目标格式
+     * 用于框架层判断是否调用 resolveTarget
+     */
+    canResolve: (params: { target: string }): boolean => {
+      const raw = (params.target ?? "").trim();
+      if (!raw) return false;
+
+      // 明确以 wecom-app: 开头的目标
+      if (raw.startsWith("wecom-app:")) return true;
+
+      // 不以其他 channel 前缀开头（如 dingtalk:, feishu: 等）
+      // 只接受 wecom-app 专有目标或裸 ID
+      const knownChannelPrefixes = ["dingtalk:", "feishu:", "wecom:", "qq:", "telegram:", "discord:", "slack:"];
+      for (const prefix of knownChannelPrefixes) {
+        if (raw.startsWith(prefix)) return false;
+      }
+
+      // user:/group: 前缀或裸 ID 都可以处理
+      return true;
+    },
+
+    /**
+     * 解析单个目标地址
+     * 将各种格式的 target 解析为可用的投递对象
      */
     resolveTarget: (params: {
       cfg: PluginConfig;
-      target: string;  // e.g., "wecom-app:CaiHongYu" or "wecom-app:group:chat123"
+      target: string;
     }): {
       channel: string;
       accountId?: string;
       to: string;
     } | null => {
-      const prefix = "wecom-app:";
-      
-      // 只处理 wecom-app: 开头的 target
-      if (!params.target.startsWith(prefix)) {
-        return null;
+      // NOTE:
+      // The OpenClaw message routing layer may pass targets in different shapes:
+      // - "wecom-app:user:xxx" or "wecom-app:group:xxx" (fully-qualified with type)
+      // - "wecom-app:xxx" (fully-qualified, default to user)
+      // - "user:xxx" or "group:xxx" (type-prefixed, bare)
+      // - "xxx" (bare ID, default to user)
+      // - "xxx@accountId" (with account selector)
+      // We accept all to avoid "Unknown target" for media sends.
+
+      let raw = (params.target ?? "").trim();
+      if (!raw) return null;
+
+      // 1. 剥离 channel 前缀 "wecom-app:"
+      const channelPrefix = "wecom-app:";
+      if (raw.startsWith(channelPrefix)) {
+        raw = raw.slice(channelPrefix.length);
       }
-      
-      const withoutPrefix = params.target.slice(prefix.length);
-      
-      // 解析 accountId（如果包含 @ 符号）
+
+      // 2. 解析 accountId（如果末尾包含 @accountId）
       let accountId: string | undefined;
-      let to = withoutPrefix;
-      
-      if (withoutPrefix.includes("@")) {
-        const parts = withoutPrefix.split("@");
-        to = parts[0]!;
-        accountId = parts[1];
+      let to = raw;
+
+      // 只在末尾查找 @，避免误解析 email 格式
+      const atIdx = raw.lastIndexOf("@");
+      if (atIdx > 0 && atIdx < raw.length - 1) {
+        // 检查 @ 之后是否是有效的 accountId（不含 : 或 /）
+        const potentialAccountId = raw.slice(atIdx + 1);
+        if (!/[:/]/.test(potentialAccountId)) {
+          to = raw.slice(0, atIdx);
+          accountId = potentialAccountId;
+        }
       }
-      
-      // 标准化目标格式
+
+      // 3. 标准化目标格式
       if (to.startsWith("group:")) {
-        // 群聊: group:xxx
-        return {
-          channel: "wecom-app",
-          accountId,
-          to,
-        };
-      } else if (to.startsWith("user:")) {
-        // 显式用户: user:xxx
-        return {
-          channel: "wecom-app",
-          accountId,
-          to,
-        };
-      } else {
-        // 默认为用户ID，添加 user: 前缀
-        return {
-          channel: "wecom-app",
-          accountId,
-          to: `user:${to}`,
-        };
+        return { channel: "wecom-app", accountId, to };
       }
+      if (to.startsWith("user:")) {
+        return { channel: "wecom-app", accountId, to };
+      }
+
+      // 4. 默认为用户ID，添加 user: 前缀
+      return { channel: "wecom-app", accountId, to: `user:${to}` };
     },
+
+    /**
+     * 批量解析多个目标地址
+     * 用于框架层批量发送消息
+     */
+    resolveTargets: (params: {
+      cfg: PluginConfig;
+      targets: string[];
+    }): Array<{
+      channel: string;
+      accountId?: string;
+      to: string;
+    }> => {
+      const results: Array<{
+        channel: string;
+        accountId?: string;
+        to: string;
+      }> = [];
+
+      for (const target of params.targets) {
+        const resolved = wecomAppPlugin.directory.resolveTarget({
+          cfg: params.cfg,
+          target,
+        });
+        if (resolved) {
+          results.push(resolved);
+        }
+      }
+
+      return results;
+    },
+
+    /**
+     * 获取此通道支持的目标格式说明
+     * 用于帮助信息和错误提示
+     */
+    getTargetFormats: (): string[] => [
+      "wecom-app:user:<userId>",
+      "wecom-app:group:<chatId>",
+      "wecom-app:<userId>",
+      "user:<userId>",
+      "group:<chatId>",
+      "<userId>",
+    ],
   },
 
   /**
@@ -292,7 +410,7 @@ export const wecomAppPlugin = {
     },
 
     /**
-     * 发送媒体消息（图片）
+     * 发送媒体消息（支持图片、语音、文件）
      * OpenClaw outbound 适配器要求的接口
      */
     sendMedia: async (params: {
@@ -331,13 +449,13 @@ export const wecomAppPlugin = {
       // 解析 to: 支持格式 "wecom-app:user:xxx" / "wecom-app:group:xxx" / "wecom-app:xxx" / "user:xxx" / "group:xxx" / "xxx"
       let to = params.to;
 
-      // 1. 先剥离 channel 前缀 "wecom-app:"
+      //1. 先剥离 channel 前缀 "wecom-app:"
       const channelPrefix = "wecom-app:";
       if (to.startsWith(channelPrefix)) {
         to = to.slice(channelPrefix.length);
       }
 
-      // 2. 解析剩余部分: "group:xxx" / "user:xxx" / "xxx"
+      //2. 解析剩余部分: "group:xxx" / "user:xxx" / "xxx"
       let target: { userId?: string; chatid?: string } = {};
       if (to.startsWith("group:")) {
         target = { chatid: to.slice(6) };
@@ -349,12 +467,28 @@ export const wecomAppPlugin = {
 
       console.log(`[wecom-app] Target parsed:`, target);
 
-      try {
-        // 使用 api.ts 中的 downloadAndSendImage 函数
-        // 流程: 下载图片 → 上传素材 → 发送图片
-        const result = await downloadAndSendImage(account, target, params.mediaUrl);
+      // 3. 检测媒体类型并路由到对应的发送函数
+      const mediaType = detectMediaType(params.mediaUrl, params.mimeType);
+      console.log(`[wecom-app] Detected media type: ${mediaType}, file: ${params.mediaUrl}`);
 
-        console.log(`[wecom-app] downloadAndSendImage returned: ok=${result.ok}, msgid=${result.msgid}, errcode=${result.errcode}, errmsg=${result.errmsg}`);
+      try {
+        let result;
+
+        if (mediaType === "image") {
+          // 图片: 下载 → 上传素材 → 发送
+          console.log(`[wecom-app] Routing to downloadAndSendImage`);
+          result = await downloadAndSendImage(account, target, params.mediaUrl);
+        } else if (mediaType === "voice") {
+          // 语音: 下载 → 上传素材 → 发送
+          console.log(`[wecom-app] Routing to downloadAndSendVoice`);
+          result = await downloadAndSendVoice(account, target, params.mediaUrl);
+        } else {
+          // 文件/其他: 下载 → 上传素材 → 发送
+          console.log(`[wecom-app] Routing to downloadAndSendFile`);
+          result = await downloadAndSendFile(account, target, params.mediaUrl);
+        }
+
+        console.log(`[wecom-app] Media send returned: ok=${result.ok}, msgid=${result.msgid}, errcode=${result.errcode}, errmsg=${result.errmsg}`);
 
         return {
           channel: "wecom-app",
