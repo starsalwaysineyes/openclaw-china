@@ -124,3 +124,63 @@ export function encryptWecomPlaintext(params: {
   const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
   return encrypted.toString("base64");
 }
+
+/**
+ * 解密企业微信媒体文件
+ *
+ * 企业微信接收到的媒体文件（图片/文件/语音）使用 AES-256-CBC 加密
+ * IV 为 encodingAESKey 的前 16 字节，使用 PKCS#7 填充
+ *
+ * @param params 解密参数
+ * @returns 解密后的 Buffer
+ * @throws Error 如果解密失败
+ *
+ * @example
+ * ```typescript
+ * const decrypted = decryptWecomMedia({
+ *   encryptedBuffer: encryptedData,
+ *   encodingAESKey: "your_encoding_aes_key",
+ * });
+ * ```
+ *
+ * 参考: https://developer.work.weixin.qq.com/document/path/100719
+ */
+export function decryptWecomMedia(params: {
+  /** 加密的媒体数据 Buffer */
+  encryptedBuffer: Buffer;
+  /** Base64 编码的 AES 密钥（43 字符） */
+  encodingAESKey: string;
+}): Buffer {
+  const { encryptedBuffer, encodingAESKey } = params;
+
+  if (!encryptedBuffer || encryptedBuffer.length === 0) {
+    throw new Error("encryptedBuffer cannot be empty");
+  }
+
+  // 解码 AES Key
+  const aesKey = decodeEncodingAESKey(encodingAESKey);
+
+  // IV 为 AES Key 的前 16 字节
+  const iv = aesKey.subarray(0, 16);
+
+  // 创建解密器
+  const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
+  decipher.setAutoPadding(false);
+
+  try {
+    // 解密数据
+    const decryptedPadded = Buffer.concat([
+      decipher.update(encryptedBuffer),
+      decipher.final(),
+    ]);
+
+    // 移除 PKCS#7 填充
+    const decrypted = pkcs7Unpad(decryptedPadded, WECOM_PKCS7_BLOCK_SIZE);
+
+    return decrypted;
+  } catch (err) {
+    throw new Error(
+      `Failed to decrypt media: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
