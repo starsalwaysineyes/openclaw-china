@@ -409,10 +409,10 @@ export async function dispatchWecomAppMessage(params: {
 
   const msgid = msg.msgid ?? msg.MsgId ?? undefined;
 
-  // 构建 replyTo 字段，用于自动回复到当前会话
+  // 构建标准化的目标标识，用于自动回复到当前会话
   // - 私聊：回复到发送者 user:senderId
   // - 群聊：回复到群聊 group:chatId
-  const replyTo = chatType === "group"
+  const normalizedTo = chatType === "group"
     ? `wecom-app:group:${chatId}`
     : `wecom-app:user:${senderId}`;
 
@@ -422,8 +422,7 @@ export async function dispatchWecomAppMessage(params: {
         RawBody: rawBody,
         CommandBody: rawBody,
         From: chatType === "group" ? `wecom-app:group:${chatId}` : `wecom-app:${senderId}`,
-        To: `wecom-app:${chatId}`,
-        replyTo,
+        To: normalizedTo,
         SessionKey: route.sessionKey,
         AccountId: route.accountId,
         ChatType: chatType,
@@ -434,15 +433,14 @@ export async function dispatchWecomAppMessage(params: {
         Surface: "wecom-app",
         MessageSid: msgid,
         OriginatingChannel: "wecom-app",
-        OriginatingTo: `wecom-app:${chatId}`,
+        OriginatingTo: normalizedTo,
       })
     : {
         Body: body,
         RawBody: rawBody,
         CommandBody: rawBody,
         From: chatType === "group" ? `wecom-app:group:${chatId}` : `wecom-app:${senderId}`,
-        To: `wecom-app:${chatId}`,
-        replyTo,
+        To: normalizedTo,
         SessionKey: route.sessionKey,
         AccountId: route.accountId,
         ChatType: chatType,
@@ -453,7 +451,7 @@ export async function dispatchWecomAppMessage(params: {
         Surface: "wecom-app",
         MessageSid: msgid,
         OriginatingChannel: "wecom-app",
-        OriginatingTo: `wecom-app:${chatId}`,
+        OriginatingTo: normalizedTo,
       }) as {
     SessionKey?: string;
     [key: string]: unknown;
