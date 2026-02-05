@@ -170,6 +170,16 @@ openclaw config set channels.wecom-app.agentId 1000002
 | 需要 IP 白名单 | ❌ | ✅ |
 | 配置复杂度 | 简单 | 中等 |
 
+**wecom-app 已实现功能清单（摘要）**
+
+- 入站：支持 JSON/XML 回调、验签与解密、长文本分片（2048 bytes）、stream 占位/刷新（5s 规则下缓冲）。
+- 入站媒体：image/voice/file/mixed 自动落盘，消息体写入 `saved:` 稳定路径；按 `keepDays` 延迟清理。
+- 出站：支持主动发送文本与媒体；支持 markdown→纯文本降级（stripMarkdown）。
+- 路由与目标：支持多种 target 解析（`wecom-app:user:..` / `user:..` / 裸 id / `@accountId`），减少 Unknown target。
+- 策略与多账号：支持 defaultAccount/accounts；dmPolicy/groupPolicy/allowlist/requireMention；inboundMedia(开关/dir/maxBytes/keepDays)。
+
+> 更完整说明见：`doc/guides/wecom-app/configuration.md`
+
 
 #### 企业微信（智能机器人）
 

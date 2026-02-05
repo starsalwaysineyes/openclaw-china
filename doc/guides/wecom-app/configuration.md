@@ -405,6 +405,47 @@ cp -a /path/to/openclaw-china/extensions/wecom-app/skills/wecom-app-ops ~/.openc
 
 ---
 
+## wecom-app 已实现功能清单（Feature List）
+
+本插件当前已实现/覆盖：
+
+### 入站（接收消息）
+- Webhook 接收回调
+- 签名校验 + 解密/加密回包
+- 支持 **JSON + XML** 两种入站格式
+- 长文本分片（企业微信单条约 2048 bytes 限制）
+- stream 占位/刷新（为适配企业微信 5 秒响应限制的缓冲式输出）
+
+### 入站媒体（产品级留存）
+- 支持 `image` / `voice` / `file` / `mixed`
+- 优先通过 `MediaId` 下载媒体；必要时回退 URL（如图片 PicUrl）
+- 媒体落盘：先 tmp 中转，再归档到 `inboundMedia.dir/YYYY-MM-DD/`
+- 消息体注入稳定路径：`[image] saved:/...` / `[voice] saved:/...` / `[file] saved:/...`
+- 过期清理：按 `inboundMedia.keepDays` 延迟清理（避免“回复后立刻删”导致 OCR/回发失败）
+- 大小限制：按 `inboundMedia.maxBytes` 限制单文件大小
+
+### 出站（主动发送）
+- 支持主动发送文本
+- 支持主动发送媒体（按 MIME/扩展名识别 image/voice/file）
+- Markdown 降级：`stripMarkdown()` 将 Markdown 转为企业微信可显示的纯文本
+
+### 目标解析与路由
+- 支持多种 target 输入格式：
+  - `wecom-app:user:<id>` / `wecom-app:group:<id>`
+  - `user:<id>` / `group:<id>`
+  - 裸 id（默认当 user）
+  - `xxx@accountId`（带账号选择）
+
+### 多账号与策略
+- 支持 `defaultAccount` + `accounts` 多账号
+- DM 策略：`dmPolicy`（open/pairing/allowlist/disabled）
+- 群策略：`groupPolicy`（open/allowlist/disabled）
+- 群 @ 要求：`requireMention`
+- allowlist：`allowFrom` / `groupAllowFrom`
+- 入站媒体配置：`inboundMedia.enabled/dir/maxBytes/keepDays`
+
+---
+
 ## 相关链接
 
 - [企业微信开发文档](https://developer.work.weixin.qq.com/document/)
