@@ -401,7 +401,7 @@ mkdir -p ~/.openclaw/skills
 cp -a /path/to/openclaw-china/extensions/wecom-app/skills/wecom-app-ops ~/.openclaw/skills/
 ```
 
-复制后无需重启网关；下次你在对话里提出相关需求时会自动触发。
+复制后一般无需重启网关；**如果你希望立刻出现在“可触发 skills 列表”里**，建议重启一次 Gateway 以刷新 skills 索引。
 
 ---
 

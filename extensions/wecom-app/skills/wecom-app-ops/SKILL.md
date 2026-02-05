@@ -28,11 +28,20 @@ description: 企业微信自建应用（wecom-app）运维与使用技能包。�
 - 如果你要“回复当前对话”，优先使用消息的 `message_id` 作为 `replyTo`。
 - `replyTo` 不是 target；target 仍然要填。
 
-### 1.3 Unknown target 怎么办
+### 1.3 Unknown target 怎么办（排查步骤）
 - 显示名（比如 `CaiHongYu`）不一定能被解析。
-- 先尝试 `user:CaiHongYu`；若仍不行，要求用户提供：
-  - 真实 userId / chatid
-  - 或让用户触发一次可被记录的对话（从 inbound ctx 或日志里拿 SenderId/ChatId）
+- 优先尝试：`target: "user:CaiHongYu"`
+
+若仍报 `Unknown target`：
+1) 先确认是 **私聊** 还是 **群聊**：
+   - 私聊：需要 `user:<userId>`
+   - 群聊：需要 `chatid:<chatId>`（群名几乎不可用）
+2) 让对方（或你自己）在企业微信里再发一条消息（任意内容），以便系统记录真实标识。
+3) 从以下任意来源抓取真实的 `userId/chatId`：
+   - OpenClaw / wecom-app 插件日志（`~/.openclaw/logs/`）
+   - 或把“收到消息时的原始字段/报错日志”贴出来，我来反推。
+4) 拿到真实值后再发：
+   - `target: "user:<userId>"` 或 `target: "chatid:<chatId>"`
 
 ---
 
@@ -56,12 +65,17 @@ wecom-app 现在会把入站媒体归档到：
 
 ## 3) 回发图片/文件/录音（标准做法）
 
-### 3.1 回发图片
+### 3.1 回发图片（注意：必须是真图片格式）
 使用 `message` 工具：
 - `channel: "wecom-app"`
 - `target: "user:<name>"`
 - `path: "<本地文件路径>"`
 - `replyTo: "<message_id>"`（可选但推荐）
+
+**格式要求（踩坑高发）：**
+- 优先使用真正的图片格式：`.png` / `.jpg` / `.jpeg`
+- `.svg` 属于“文件”，有时能发送但不一定按“图片”显示。
+- 若只有 `.svg`：先转成 `.png` 再发（可选工具：`rsvg-convert` / ImageMagick `convert` / 或用脚本生成 PNG 兜底）。
 
 ### 3.2 回发录音
 - 确认文件格式：常见为 `.amr`
@@ -96,6 +110,21 @@ wecom-app 现在会把入站媒体归档到：
 - `inboundMedia.maxBytes`：单个媒体大小限制（默认 10MB）
 
 要修改：编辑 `openclaw.json` 的 `channels.wecom-app.inboundMedia`。
+
+可复制模板：
+```json
+{
+  "channels": {
+    "wecom-app": {
+      "inboundMedia": {
+        "enabled": true,
+        "keepDays": 7,
+        "maxBytes": 10485760
+      }
+    }
+  }
+}
+```
 
 ---
 
