@@ -13,6 +13,14 @@ export const QQBotConfigSchema = z.object({
   enabled: z.boolean().optional().default(true),
   appId: optionalCoercedString,
   clientSecret: optionalCoercedString,
+  asr: z
+    .object({
+      enabled: z.boolean().optional().default(false),
+      appId: optionalCoercedString,
+      secretId: optionalCoercedString,
+      secretKey: optionalCoercedString,
+    })
+    .optional(),
   markdownSupport: z.boolean().optional().default(false),
   dmPolicy: z.enum(["open", "pairing", "allowlist"]).optional().default("open"),
   groupPolicy: z.enum(["open", "allowlist", "disabled"]).optional().default("open"),
@@ -37,4 +45,17 @@ export function resolveQQBotCredentials(
 ): { appId: string; clientSecret: string } | undefined {
   if (!config?.appId || !config?.clientSecret) return undefined;
   return { appId: config.appId, clientSecret: config.clientSecret };
+}
+
+export function resolveQQBotASRCredentials(
+  config: QQBotConfig | undefined
+): { appId: string; secretId: string; secretKey: string } | undefined {
+  const asr = config?.asr;
+  if (!asr?.enabled) return undefined;
+  if (!asr.appId || !asr.secretId || !asr.secretKey) return undefined;
+  return {
+    appId: asr.appId,
+    secretId: asr.secretId,
+    secretKey: asr.secretKey,
+  };
 }

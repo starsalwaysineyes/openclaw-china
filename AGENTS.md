@@ -77,14 +77,14 @@ moltbot-china/
 ```
 
 ## Core Conventions
-- Each plugin must include `moltbot.plugin.json` with a JSON Schema (even if empty).
+- Each plugin must include `openclaw.plugin.json` with a JSON Schema (even if empty).
 - Plugins register channels via `api.registerChannel({ plugin })`.
 - Channel configuration lives under `channels.<id>`; multi-account uses `channels.<id>.accounts.<accountId>`.
 - Keep channels focused on message receive/send. Defer extra features unless required.
 - Voice features use Node-based tooling (no Python voice stack).
 
 ## Suggested Layout (for new plugins)
-- `extensions/<channel-id>/moltbot.plugin.json`
+- `extensions/<channel-id>/openclaw.plugin.json`
 - `extensions/<channel-id>/package.json`
 - `extensions/<channel-id>/index.ts`
 - `extensions/<channel-id>/src/*`

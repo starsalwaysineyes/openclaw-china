@@ -8,14 +8,20 @@ import {
   cleanupFileSafe,
   createLogger,
   downloadToTempFile,
+  fetchMediaFromUrl,
   type Logger,
   appendCronHiddenPrompt,
   extractMediaFromText,
   isImagePath,
 } from "@openclaw-china/shared";
-import { QQBotConfigSchema, type QQBotConfig } from "./config.js";
+import {
+  QQBotConfigSchema,
+  resolveQQBotASRCredentials,
+  type QQBotConfig,
+} from "./config.js";
 import { qqbotOutbound } from "./outbound.js";
 import { getQQBotRuntime } from "./runtime.js";
+import { transcribeTencentFlash } from "./asr/tencent-flash.js";
 import type {
   InboundContext,
   QQInboundAttachment,
@@ -98,7 +104,17 @@ function parseTextWithAttachments(payload: Record<string, unknown>): {
 type ResolvedInboundAttachment = {
   attachment: QQInboundAttachment;
   localImagePath?: string;
+  voiceTranscript?: string;
 };
+
+type ResolvedInboundAttachmentResult = {
+  attachments: ResolvedInboundAttachment[];
+  hasVoiceAttachment: boolean;
+  hasVoiceTranscript: boolean;
+};
+
+const VOICE_ASR_FALLBACK_TEXT = "当前语音功能未启动或识别失败，请稍后重试。";
+const VOICE_EXTENSIONS = [".silk", ".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".speex"];
 
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
@@ -121,6 +137,25 @@ function isImageAttachment(att: QQInboundAttachment): boolean {
   }
 }
 
+function isVoiceAttachment(att: QQInboundAttachment): boolean {
+  const contentType = att.contentType?.trim().toLowerCase() ?? "";
+  if (contentType === "voice" || contentType.startsWith("audio/")) {
+    return true;
+  }
+
+  const lowerName = att.filename?.trim().toLowerCase() ?? "";
+  if (VOICE_EXTENSIONS.some((ext) => lowerName.endsWith(ext))) {
+    return true;
+  }
+
+  try {
+    const pathname = new URL(att.url).pathname.toLowerCase();
+    return VOICE_EXTENSIONS.some((ext) => pathname.endsWith(ext));
+  } catch {
+    return false;
+  }
+}
+
 function scheduleTempCleanup(filePath: string): void {
   const timer = setTimeout(() => {
     void cleanupFileSafe(filePath);
@@ -132,16 +167,26 @@ async function resolveInboundAttachmentsForAgent(params: {
   attachments?: QQInboundAttachment[];
   qqCfg: QQBotConfig;
   logger: Logger;
-}): Promise<ResolvedInboundAttachment[]> {
+}): Promise<ResolvedInboundAttachmentResult> {
   const { attachments, qqCfg, logger } = params;
   const list = attachments ?? [];
-  if (list.length === 0) return [];
+  if (list.length === 0) {
+    return {
+      attachments: [],
+      hasVoiceAttachment: false,
+      hasVoiceTranscript: false,
+    };
+  }
 
   const timeout = qqCfg.mediaTimeoutMs ?? 30000;
   const maxFileSizeMB = qqCfg.maxFileSizeMB ?? 100;
   const maxSize = Math.floor(maxFileSizeMB * 1024 * 1024);
+  const asrCredentials = resolveQQBotASRCredentials(qqCfg);
 
   const resolved: ResolvedInboundAttachment[] = [];
+  let hasVoiceAttachment = false;
+  let hasVoiceTranscript = false;
+
   for (const att of list) {
     const next: ResolvedInboundAttachment = { attachment: att };
     if (isImageAttachment(att) && isHttpUrl(att.url)) {
@@ -159,9 +204,49 @@ async function resolveInboundAttachmentsForAgent(params: {
         logger.warn(`failed to download inbound attachment: ${String(err)}`);
       }
     }
+
+    if (isVoiceAttachment(att)) {
+      hasVoiceAttachment = true;
+      if (!qqCfg.asr?.enabled) {
+        logger.info("voice attachment received but ASR is disabled");
+      } else if (!asrCredentials) {
+        logger.warn("voice ASR enabled but credentials are missing or invalid");
+      } else if (!isHttpUrl(att.url)) {
+        logger.warn("voice ASR skipped: attachment URL is not an HTTP URL");
+      } else {
+        try {
+          const media = await fetchMediaFromUrl(att.url, {
+            timeout,
+            maxSize,
+          });
+          const transcript = await transcribeTencentFlash({
+            audio: media.buffer,
+            config: {
+              appId: asrCredentials.appId,
+              secretId: asrCredentials.secretId,
+              secretKey: asrCredentials.secretKey,
+              timeoutMs: timeout,
+            },
+          });
+          if (transcript.trim()) {
+            next.voiceTranscript = transcript.trim();
+            hasVoiceTranscript = true;
+            logger.info(
+              `[voice-asr] transcript: ${next.voiceTranscript}${att.filename ? ` (file: ${att.filename})` : ""}`
+            );
+          }
+        } catch (err) {
+          logger.warn(`voice ASR failed: ${String(err)}`);
+        }
+      }
+    }
     resolved.push(next);
   }
-  return resolved;
+  return {
+    attachments: resolved,
+    hasVoiceAttachment,
+    hasVoiceTranscript,
+  };
 }
 
 function buildInboundContentWithAttachments(params: {
@@ -177,6 +262,13 @@ function buildInboundContentWithAttachments(params: {
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .map((value) => `[Image: source: ${value}]`);
 
+  const voiceTranscripts = list
+    .filter((item) => typeof item.voiceTranscript === "string" && item.voiceTranscript.trim())
+    .map((item, index) => {
+      const filename = item.attachment.filename?.trim() || `voice-${index + 1}`;
+      return `- ${filename}: ${item.voiceTranscript as string}`;
+    });
+
   const lines = list.map((item, index) => {
     const att = item.attachment;
     const filename = att.filename?.trim() ? att.filename.trim() : `attachment-${index + 1}`;
@@ -191,8 +283,35 @@ function buildInboundContentWithAttachments(params: {
   const parts: string[] = [];
   if (content) parts.push(content);
   if (imageRefs.length > 0) parts.push(imageRefs.join("\n"));
+  if (voiceTranscripts.length > 0) {
+    parts.push(["[QQ voice transcripts]", ...voiceTranscripts].join("\n"));
+  }
   parts.push(block);
   return parts.join("\n\n");
+}
+
+function resolveInboundLogContent(params: {
+  content: string;
+  attachments?: QQInboundAttachment[];
+}): string {
+  const text = params.content.trim();
+  if (text) return text;
+
+  const attachments = params.attachments ?? [];
+  if (attachments.some((att) => isVoiceAttachment(att))) {
+    return "【语音】";
+  }
+  if (attachments.some((att) => isImageAttachment(att))) {
+    return "【图片】";
+  }
+  if (attachments.length > 0) {
+    return "【附件】";
+  }
+  return "【空消息】";
+}
+
+function sanitizeInboundLogText(text: string): string {
+  return text.replace(/\r?\n/g, "\\n");
 }
 
 function parseC2CMessage(data: unknown): QQInboundMessage | null {
@@ -511,11 +630,28 @@ async function dispatchToAgent(params: {
     storePath && sessionApi?.readSessionUpdatedAt
       ? sessionApi.readSessionUpdatedAt({ storePath, sessionKey: route.sessionKey })
       : null;
-  const resolvedAttachments = await resolveInboundAttachmentsForAgent({
+  const resolvedAttachmentResult = await resolveInboundAttachmentsForAgent({
     attachments: inbound.attachments,
     qqCfg,
     logger,
   });
+  if (
+    qqCfg.asr?.enabled &&
+    resolvedAttachmentResult.hasVoiceAttachment &&
+    !resolvedAttachmentResult.hasVoiceTranscript
+  ) {
+    const fallback = await qqbotOutbound.sendText({
+      cfg: { channels: { qqbot: qqCfg } },
+      to: target.to,
+      text: VOICE_ASR_FALLBACK_TEXT,
+      replyToId: inbound.messageId,
+    });
+    if (fallback.error) {
+      logger.error(`sendText ASR fallback failed: ${fallback.error}`);
+    }
+    return;
+  }
+  const resolvedAttachments = resolvedAttachmentResult.attachments;
   const localImageCount = resolvedAttachments.filter((item) => Boolean(item.localImagePath)).length;
   if (localImageCount > 0) {
     logger.info(`prepared ${localImageCount} local image attachment(s) for agent`);
@@ -828,11 +964,19 @@ export async function handleQQBotDispatch(params: DispatchParams): Promise<void>
     return;
   }
 
+  const content = inbound.content.trim();
+  const inboundLogContent = sanitizeInboundLogText(
+    resolveInboundLogContent({
+      content,
+      attachments: inbound.attachments,
+    })
+  );
+  logger.info(`[inbound-user] senderId=${inbound.senderId} content=${inboundLogContent}`);
+
   if (!shouldHandleMessage(inbound, qqCfg, logger)) {
     return;
   }
 
-  const content = inbound.content.trim();
   const attachmentCount = inbound.attachments?.length ?? 0;
   if (attachmentCount > 0) {
     logger.info(`inbound message includes ${attachmentCount} attachment(s)`);

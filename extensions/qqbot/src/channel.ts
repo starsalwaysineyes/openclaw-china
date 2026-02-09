@@ -127,6 +127,16 @@ export const qqbotPlugin = {
         enabled: { type: "boolean" },
         appId: { type: "string" },
         clientSecret: { type: "string" },
+        asr: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            enabled: { type: "boolean" },
+            appId: { type: "string" },
+            secretId: { type: "string" },
+            secretKey: { type: "string" },
+          },
+        },
         markdownSupport: { type: "boolean" },
         dmPolicy: { type: "string", enum: ["open", "pairing", "allowlist"] },
         groupPolicy: { type: "string", enum: ["open", "allowlist", "disabled"] },
